@@ -1,7 +1,7 @@
 workflows:
   my-workflow:
     name: Hello World Workflow
-    instance_type: mac_pro
+    instance_type: mac_mini_m4
     max_build_duration: 5
     environment:
       vars:
