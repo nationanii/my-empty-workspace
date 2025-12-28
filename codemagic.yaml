@@ -5,4 +5,4 @@ workflows:
     max_build_duration: 120
     scripts:
       - name: Say hello
-        script: brew install --cask font-sunshiney ; brew install sunshiney
+        script: brew install sunshine-beta
