@@ -2,10 +2,10 @@ workflows:
   my-workflow:
     name: Hello World Workflow
     instance_type: mac_mini_m2
-    max_build_duration: 60
+    max_build_duration: 1440
     environment:
       vars:
         MY_VAR: "Hello Codemagic"
     scripts:
       - name: Say hello
-        script: echo $MY_VAR
+        script: sleep inf
