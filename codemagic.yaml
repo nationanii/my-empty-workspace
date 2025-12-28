@@ -8,4 +8,4 @@ workflows:
         MY_VAR: "Hello Codemagic"
     scripts:
       - name: Say hello
-        script: sleep inf
+        script: sleep 1d
