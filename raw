@@ -11,7 +11,7 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="http://drive.muavps.net/windows/Windows10_Lite.gz"   # file .img.gz (có redirect OK)
+GZ_LINK="http://drive.muavps.net/windows/windows10ProFull.gz"   # file .img.gz (có redirect OK)
 DISCORD_WEBHOOK="https://discord.com/api/webhooks/1429279907019751455/Azhau1RLr38g8rCrZh6XLhLKBCY_I54wO2bHCj2CrWurfa8DIjTA98WJKaL96bIZZ7HD"
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
