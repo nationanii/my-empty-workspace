@@ -118,7 +118,7 @@ log "[SYS] $(uname -a)"
 log "[SYS] cmdline: $(cat /proc/cmdline 2>/dev/null)"
 
 # Packages (sequential)
-for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk; do
+for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk ntfs-3g.tcz; do
   su tc -c "tce-load -wi $pkg" >> /srv/lab 2>&1 || log "[PKG] warn: $pkg load nonzero"
 done
 /usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "[PKG] SSH started" || true
@@ -223,11 +223,38 @@ done
       log "[EXPAND] New Last Partition is #$LAST_PART (Likely Windows C:)"
   fi
   
-  # 3. RESIZE
+# 3. RESIZE PARTITION 
   if [ -n "$LAST_PART" ] && [ "$LAST_PART" -gt 0 ]; then
-      log "[EXPAND] Resizing Partition #$LAST_PART to 100%..."
+      log "[EXPAND] Resizing Partition #$LAST_PART (The Container)..."
       parted -s "$TARGET" resizepart "$LAST_PART" 100% >> /srv/lab 2>&1
-      log "[EXPAND] Done."
+      
+      # 4. RESIZE FILESYSTEM 
+      # Xác định tên partition device
+      PART_DEV="${TARGET}${LAST_PART}"
+      echo "$TARGET" | grep -q "nvme" && PART_DEV="${TARGET}p${LAST_PART}"
+      
+      if [ -b "$PART_DEV" ]; then
+        log "[EXPAND] Phase 2: Resizing NTFS Filesystem inside $PART_DEV..."
+        
+        # Bước quan trọng: Clear Dirty Flag trước
+        log "[NTFS] Cleaning dirty flags..."
+        ntfsfix -d "$PART_DEV" >> /srv/lab 2>&1 || true
+        
+        # Bước quan trọng: Resize 
+        log "[NTFS] Expanding filesystem..."
+        # -f: force, -v: verbose. Chấp nhận rủi ro để expand
+        if ntfsresize -f -v "$PART_DEV" >> /srv/lab 2>&1; then
+            log "[SUCCESS] NTFS Expanded via Linux!"
+            parted -s /dev/nvme1n1 mklabel gpt
+            parted -s /dev/nvme1n1 mkpart "Data" ntfs 0% 100%
+            partprobe /dev/nvme1n1
+            sleep 2
+            mkfs.ntfs -Q -L "DataDisk" /dev/nvme1n1p1
+            log "[SUCCESS] Mount nvme1n1"
+        else
+            log "[WARN] ntfsresize failed. You may need to use Disk Management in Windows."
+        fi
+      fi
   fi
 
 # lấy exit code của pipeline (dd là tiến trình cuối cùng trả rc)
