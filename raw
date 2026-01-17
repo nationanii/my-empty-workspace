@@ -198,37 +198,36 @@ while kill -0 "$PIPE_PID" 2>/dev/null; do
   fi
   sleep 5; i=$((i+5))
 done
-
+# --- AUTO EXPAND (NO RECOVERY MODE) ---
   log "[EXPAND] Fixing Partition Table..."
   
-  # 1. Fix GPT Backup Header Location (Chuyển header từ giữa đĩa xuống cuối đĩa)
-  # sgdisk -e là lệnh thần thánh để sửa lỗi này
-  if sgdisk -e "$TARGET" >> /srv/lab 2>&1; then
-      log "[EXPAND] GPT Header moved to end of disk."
-  else
-      log "[WARN] sgdisk failed (Maybe MBR disk?). Trying parted fix..."
-      # Trick: Parted print sẽ hỏi fix -> ta chọn Ignore hoặc Fix.
-      # Ở đây ta dùng lệnh print để force kernel đọc lại
-      parted -s "$TARGET" print >/dev/null 2>&1 || true
-  fi
-  
+  # 1. Fix GPT Header (đá header xuống cuối đĩa)
+  sgdisk -e "$TARGET" >> /srv/lab 2>&1 || true
   partprobe "$TARGET" || true
   sleep 2
   
-  # 2. FIND LAST PARTITION (Tìm phân vùng cuối cùng)
-  # parted -m output: 1:1049kB:106MB:105MB:fat32:EFI System:boot,esp;
-  # Ta lấy dòng cuối cùng, cắt lấy cột 1
-  LAST_PART_NUM=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | awk -F: '{print $1}')
+  # 2. DELETE RECOVERY PARTITION LOGIC
+  # Lấy số thứ tự phân vùng cuối cùng
+  LAST_PART=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | awk -F: '{print $1}')
   
-  if [ -n "$LAST_PART_NUM" ] && [ "$LAST_PART_NUM" -gt 0 ]; then
-      log "[EXPAND] Detected Last Partition: #$LAST_PART_NUM"
-      log "[EXPAND] Resizing Partition #$LAST_PART_NUM to 100%..."
+  # Nếu số phân vùng >= 3 (thường là 1:EFI, 2:MSR, 3:Windows, 4:Recovery)
+  if [ -n "$LAST_PART" ] && [ "$LAST_PART" -ge 3 ]; then
+      log "[EXPAND] Found Partition #$LAST_PART at end of disk."
+      log "[EXPAND] Deleting Partition #$LAST_PART (Assuming Recovery/Swap)..."
       
-      parted -s "$TARGET" resizepart "$LAST_PART_NUM" 100% >> /srv/lab 2>&1
+      # XÓA PHÂN VÙNG CUỐI
+      parted -s "$TARGET" rm "$LAST_PART" >> /srv/lab 2>&1
       
-      log "[EXPAND] Resize command sent."
-  else
-      log "[ERR] Could not detect partition number. Skipping resize."
+      # Cập nhật lại: Phân vùng cuối bây giờ là phân vùng kế trước (Ổ C:)
+      LAST_PART=$((LAST_PART - 1))
+      log "[EXPAND] New Last Partition is #$LAST_PART (Likely Windows C:)"
+  fi
+  
+  # 3. RESIZE
+  if [ -n "$LAST_PART" ] && [ "$LAST_PART" -gt 0 ]; then
+      log "[EXPAND] Resizing Partition #$LAST_PART to 100%..."
+      parted -s "$TARGET" resizepart "$LAST_PART" 100% >> /srv/lab 2>&1
+      log "[EXPAND] Done."
   fi
 
 # lấy exit code của pipeline (dd là tiến trình cuối cùng trả rc)
