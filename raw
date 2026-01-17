@@ -247,7 +247,7 @@ echo "[5/6] Repack initrd..."
 find . | cpio -o -H newc | gzip -c > "$INITRD_PATCHED"
 
 echo "[6/6] Kexec TinyCore..."
-CMDLINE="console=ttyS0 quiet"
+CMDLINE="console=ttyS0 quiet net.ifnames=0 biosdevname=0 $CMD_IP"
 kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"
 echo "===================================================="
 echo "🚀 TinyCore v7-netfix-stable-bootfix: safe target + real DHCP + wget|gunzip|dd + bootfix"
