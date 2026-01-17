@@ -12,7 +12,7 @@ set -euo pipefail
 
 # === USER CONFIG =====================================================
 GZ_LINK="http://drive.muavps.net/windows/Windows10_Lite.gz"   # file .img.gz (có redirect OK)
-DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlvc-0CWC7VpM30bKr1ulMPUrCFZAUr7r06VPqFkbgCvCRbuyde_Ffc-0joff"
+DISCORD_WEBHOOK="http://drive.muavps.net/file/Windows2022UEFI.gz"
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
 # === TINYCORE BOOT ARTIFACTS =========================================
