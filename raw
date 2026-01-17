@@ -154,7 +154,7 @@ fi
 # Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
 log "[DISK] Detecting target..."
 TARGET=""
-for d in /dev/nvme1n1 ; do [ -b "$d" ] && TARGET="$d" && break; done
+for d in /dev/nvme0n1 ; do [ -b "$d" ] && TARGET="$d" && break; done
 [ -z "$TARGET" ] && TARGET="$(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | head -n1 | awk '{print "/dev/"$1}')"
 [ -z "$TARGET" ] && { log "[ERR] No disk. Rebooting in 3s..."; sleep 3; reboot -f; }
 log "[DISK] Using: $TARGET"
@@ -167,8 +167,8 @@ done
 sync; sleep 3
 
 # Xác định boot-disk (đĩa hiện chứa /boot hoặc root)
-BOOTDISK="$(lsblk -no PKNAME "$(readlink -f /dev/root 2>/dev/null || echo /dev/nvme0n1p15)" 2>/dev/null | sed 's#^#/dev/#')"
-[ -z "$BOOTDISK" ] && BOOTDISK="/dev/nvme0n1p15"
+BOOTDISK="$(lsblk -no PKNAME "$(readlink -f /dev/root 2>/dev/null || echo /dev/nvme0n1)" 2>/dev/null | sed 's#^#/dev/#')"
+[ -z "$BOOTDISK" ] && BOOTDISK="/dev/nvme0n1"
 log "[DISK] Boot-disk guessed: $BOOTDISK"
 
 # Debug redirect chain (không fail nếu lỗi)
