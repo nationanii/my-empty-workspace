@@ -200,6 +200,19 @@ while kill -0 "$PIPE_PID" 2>/dev/null; do
   sleep 5; i=$((i+5))
 done
 
+log "[EXPAND] Resizing partition to fill disk..."
+
+# 1. Fix GPT Backup Header (Move to end of physical disk)
+# sgdisk -e (Move backup data to end of disk)
+sgdisk -e "$TARGET" >> /srv/lab 2>&1 || true
+  
+# 2. Tell kernel to re-read partition table
+partprobe "$TARGET" || true
+sleep 1
+parted -s "$TARGET" resizepart 1 100% >> /srv/lab 2>&1 || true
+  
+log "[EXPAND] Partition table updated."
+
 # lấy exit code của pipeline (dd là tiến trình cuối cùng trả rc)
 wait "$PIPE_PID"
 RC=$?
