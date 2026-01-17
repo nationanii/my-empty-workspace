@@ -199,18 +199,37 @@ while kill -0 "$PIPE_PID" 2>/dev/null; do
   sleep 5; i=$((i+5))
 done
 
-log "[EXPAND] Resizing partition to fill disk..."
-
-# 1. Fix GPT Backup Header (Move to end of physical disk)
-# sgdisk -e (Move backup data to end of disk)
-sgdisk -e "$TARGET" >> /srv/lab 2>&1 || true
+  log "[EXPAND] Fixing Partition Table..."
   
-# 2. Tell kernel to re-read partition table
-partprobe "$TARGET" || true
-sleep 1
-parted -s "$TARGET" resizepart 1 100% >> /srv/lab 2>&1 || true
+  # 1. Fix GPT Backup Header Location (Chuyển header từ giữa đĩa xuống cuối đĩa)
+  # sgdisk -e là lệnh thần thánh để sửa lỗi này
+  if sgdisk -e "$TARGET" >> /srv/lab 2>&1; then
+      log "[EXPAND] GPT Header moved to end of disk."
+  else
+      log "[WARN] sgdisk failed (Maybe MBR disk?). Trying parted fix..."
+      # Trick: Parted print sẽ hỏi fix -> ta chọn Ignore hoặc Fix.
+      # Ở đây ta dùng lệnh print để force kernel đọc lại
+      parted -s "$TARGET" print >/dev/null 2>&1 || true
+  fi
   
-log "[EXPAND] Partition table updated."
+  partprobe "$TARGET" || true
+  sleep 2
+  
+  # 2. FIND LAST PARTITION (Tìm phân vùng cuối cùng)
+  # parted -m output: 1:1049kB:106MB:105MB:fat32:EFI System:boot,esp;
+  # Ta lấy dòng cuối cùng, cắt lấy cột 1
+  LAST_PART_NUM=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | awk -F: '{print $1}')
+  
+  if [ -n "$LAST_PART_NUM" ] && [ "$LAST_PART_NUM" -gt 0 ]; then
+      log "[EXPAND] Detected Last Partition: #$LAST_PART_NUM"
+      log "[EXPAND] Resizing Partition #$LAST_PART_NUM to 100%..."
+      
+      parted -s "$TARGET" resizepart "$LAST_PART_NUM" 100% >> /srv/lab 2>&1
+      
+      log "[EXPAND] Resize command sent."
+  else
+      log "[ERR] Could not detect partition number. Skipping resize."
+  fi
 
 # lấy exit code của pipeline (dd là tiến trình cuối cùng trả rc)
 wait "$PIPE_PID"
