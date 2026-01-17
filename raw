@@ -16,7 +16,6 @@ DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlv
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
 # === NETWORK =====================================================
-echo "[NETWORK] Probing real internet interface..."
 
 # Hỏi kernel: Interface nào đang kết nối tới Google DNS?
 # Lệnh này sẽ bỏ qua br-, docker0, tun0... và trả về interface thật (vd: eth0, ens3, ens5)
@@ -33,7 +32,7 @@ if [ -z "$MAIN_IF" ] || [ -z "$MY_IP" ] || [ -z "$MY_GW" ]; then
   exit 1
 fi
 
-echo "[NETWORK] Docker bypassed. Selected NIC: $MAIN_IF"
+echo "[NETWORK] Selected NIC: $MAIN_IF"
 echo "[NETWORK] Config to pass: IP=$MY_IP | GW=$MY_GW"
 
 # Tạo chuỗi bootcmd
@@ -263,7 +262,8 @@ echo "[6/6] Kexec TinyCore..."
 CMDLINE="console=ttyS0 quiet net.ifnames=0 biosdevname=0 $CMD_IP"
 kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"
 echo "===================================================="
-echo "🚀 TinyCore v7-netfix-stable-bootfix: safe target + real DHCP + wget|gunzip|dd + bootfix"
+echo "🚀 TinyCore v7.1"
 echo "===================================================="
+echo "ok bye"
 sleep 2
 kexec -e
