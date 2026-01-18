@@ -58,8 +58,6 @@ mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
 wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL"
 chmod +x "$WORKDIR/srv/busybox"
 
-# === 3. INJECT BOOTLOCAL.SH (CORE LOGIC) =============================
-cat > "$WORKDIR/opt/bootlocal.sh" <<'EOS'
 # === 3. INJECT BOOTLOCAL.SH (FIXED WEBHOOK) ==========================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOS'
 #!/bin/sh
