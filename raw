@@ -60,30 +60,25 @@ chmod +x "$WORKDIR/srv/busybox"
 
 # === 3. INJECT BOOTLOCAL.SH (CORE LOGIC) =============================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOS'
+# === 3. INJECT BOOTLOCAL.SH (FIXED WEBHOOK) ==========================
+cat > "$WORKDIR/opt/bootlocal.sh" <<'EOS'
 #!/bin/sh
-# TinyCore Internal Script v8
+# TinyCore Internal Script v8.1-WebhookFix
 IMAGE_URL="__TC_GZ_LINK__"
 DISCORD_WEBHOOK="__TC_DISCORD__"
 SWAP_URL="__TC_SWAP_URL__"
 
-# --- HELPER FUNCTIONS ---
-safe_echo() { echo "$1" | sed 's/"/\\"/g'; }
-post_discord() {
-  [ -z "$DISCORD_WEBHOOK" ] && return 0
-  echo "$1" | awk '{print substr($0,1,1800)}' | while read -r c; do
-    [ -z "$c" ] && continue
-    curl -m 3 -sS -H "Content-Type: application/json" \
-      -d "{\"content\":\"\`\`\`$(safe_echo "$c")\`\`\`\"}" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
-  done
-}
-log(){ echo "$1" | tee -a /srv/lab >/dev/null; post_discord "$1"; }
-
-# --- INIT ---
+# --- ENV SETUP ---
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 mkdir -p /srv && touch /srv/lab
 /srv/busybox httpd -p 80 -h /srv &
 
-# Parse Host Network Params
+# --- 1. NETWORK & PACKAGES FIRST (CRITICAL FOR LOGGING) ---
+# Kích hoạt card mạng trước
+ip link set lo up
+ip link set eth0 up
+
+# Lấy IP tĩnh nếu có (để có mạng tải curl)
 for x in $(cat /proc/cmdline); do
   case "$x" in
     STATIC_IP=*) MIP="${x#*=}" ;;
@@ -92,34 +87,52 @@ for x in $(cat /proc/cmdline); do
   esac
 done
 
-# --- NETWORK SETUP ---
-log "[BOOT] TinyCore v8-Turbo started."
-ip link set lo up
-ip link set eth0 up
-
 if [ -n "$MIP" ]; then
-  log "[NET] Static: $MIP"
   ip addr add "$MIP" dev eth0
   ip route add default via "$MGW"
   echo "nameserver $MDNS" > /etc/resolv.conf
 else
-  log "[NET] DHCP Request..."
   udhcpc -b -i eth0 -t 5 -T 3 >/dev/null 2>&1
 fi
 
-# Wait for network
-for i in $(seq 1 10); do
-  ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1 && break
-  sleep 1
-done
+# Đợi mạng 1 chút
+sleep 3
+# Ping thử Google để kích hoạt route
+ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1
 
-# --- LOAD PACKAGES ---
-log "[PKG] Loading tools..."
-tce-load -wi ca-certificates openssl curl openssh parted gdisk ntfs-3g >/dev/null 2>&1
+# ==> CÀI CURL NGAY LẬP TỨC ĐỂ CÓ THỂ GỬI LOG <==
+# Load tạm wget của busybox để tải extension nếu tce-load fail (phòng hờ)
+tce-load -wi ca-certificates openssl curl >/dev/null 2>&1 || true
+
+# --- HELPER FUNCTIONS ---
+safe_echo() { echo "$1" | sed 's/"/\\"/g'; }
+post_discord() {
+  [ -z "$DISCORD_WEBHOOK" ] && return 0
+  
+  # Kiểm tra xem curl đã có chưa, nếu chưa có thì thôi
+  if ! command -v curl >/dev/null; then return 0; fi
+
+  # Cắt nhỏ message để tránh lỗi limit 2000 char của Discord
+  echo "$1" | awk '{print substr($0,1,1800)}' | while read -r c; do
+    [ -z "$c" ] && continue
+    # Thêm -k để bỏ qua lỗi SSL (thường gặp ở TinyCore date sai giờ)
+    curl -k -m 5 -sS -H "Content-Type: application/json" \
+      -d "{\"content\":\"\`\`\`$(safe_echo "$c")\`\`\`\"}" \
+      "$DISCORD_WEBHOOK" >> /srv/lab 2>&1 || true
+  done
+}
+log(){ echo "$1" | tee -a /srv/lab >/dev/null; post_discord "$1"; }
+
+# --- START LOGIC ---
+log "[BOOT] Network & Curl ready. TinyCore v8.1 Started."
+if [ -n "$MIP" ]; then log "[NET] Mode: Static IP ($MIP)"; else log "[NET] Mode: DHCP"; fi
+
+# Load các tools còn lại
+log "[PKG] Loading disk tools (parted, gdisk, ntfs-3g)..."
+tce-load -wi openssh parted gdisk ntfs-3g >/dev/null 2>&1
 /usr/local/etc/init.d/openssh start >/dev/null 2>&1 &
 
 # --- DISK SELECTION ---
-# Priority: NVMe -> VDA -> SDA
 TARGET=""
 for d in /dev/nvme0n1 /dev/vda /dev/sda; do
   if [ -b "$d" ]; then TARGET="$d"; break; fi
@@ -148,6 +161,7 @@ start_ts=$(date +%s)
 while kill -0 "$PIPE_PID" 2>/dev/null; do
   sleep 10
   curr_ts=$(date +%s)
+  # Gửi log tiến độ mỗi 10s (chỉ ghi vào file local để đỡ spam Discord)
   echo "[IMG] Running... $((curr_ts - start_ts))s" >> /srv/lab
 done
 
@@ -158,26 +172,25 @@ if [ "$?" -ne 0 ]; then
 fi
 
 # ==================================================================
-# SMART EXPAND LOGIC (MERGED)
+# SMART EXPAND LOGIC
 # ==================================================================
 log "[EXPAND] Image written. Optimizing partitions..."
 partprobe "$TARGET" || true
 sleep 1
 
-# 1. Fix GPT Header (đá backup header xuống cuối đĩa)
+# 1. Fix GPT Header
 sgdisk -e "$TARGET" >/dev/null 2>&1 || true
 partprobe "$TARGET"
 sleep 1
 
-# 2. Xóa phân vùng Recovery/OEM chặn đường (Lặp 2 lần để chắc chắn)
+# 2. Xóa Recovery/OEM
 for loop in 1 2; do
     LAST_INFO=$(parted -m "$TARGET" unit MB print 2>/dev/null | tail -n 1 | grep -v "BYT")
     LAST_NUM=$(echo "$LAST_INFO" | cut -d: -f1)
-    LAST_SIZE=$(echo "$LAST_INFO" | cut -d: -f4 | tr -d 'MB' | cut -d. -f1) # Lấy phần nguyên
+    LAST_SIZE=$(echo "$LAST_INFO" | cut -d: -f4 | tr -d 'MB' | cut -d. -f1)
 
-    # Nếu < 2048MB (2GB) thì xóa. Nếu lớn hơn thì thôi (đó là ổ C)
     if [ -n "$LAST_NUM" ] && [ "$LAST_SIZE" -lt 2048 ]; then
-        log "[EXPAND] Removing blocker partition #$LAST_NUM (${LAST_SIZE}MB)"
+        log "[EXPAND] Removing partition #$LAST_NUM (${LAST_SIZE}MB)"
         parted -s "$TARGET" rm "$LAST_NUM" >/dev/null 2>&1
         partprobe "$TARGET"
         sleep 1
@@ -186,29 +199,26 @@ for loop in 1 2; do
     fi
 done
 
-# 3. Resize ổ C (Phân vùng cuối cùng còn lại)
+# 3. Resize ổ C
 TARGET_PART=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | cut -d: -f1)
 
 if [ -n "$TARGET_PART" ]; then
-    log "[EXPAND] Expanding Partition #$TARGET_PART to 100%..."
+    log "[EXPAND] Expanding Partition #$TARGET_PART..."
     parted -s "$TARGET" resizepart "$TARGET_PART" 100% >/dev/null 2>&1
     partprobe "$TARGET"
     sleep 1
     
-    # Xác định tên device (NVMe dùng p1, SATA dùng 1)
     case "$TARGET" in
         *[0-9]) PART_DEV="${TARGET}p${TARGET_PART}" ;;
         *)      PART_DEV="${TARGET}${TARGET_PART}"   ;;
     esac
 
-    # 4. Expand NTFS Filesystem
     if [ -b "$PART_DEV" ]; then
-        log "[NTFS] Fixing & Resizing filesystem..."
-        ntfsfix -b -d "$PART_DEV" >/dev/null 2>&1 || true  # Clear dirty bit
+        ntfsfix -b -d "$PART_DEV" >/dev/null 2>&1 || true
         if ntfsresize -f -b "$PART_DEV" >/dev/null 2>&1; then
              log "[SUCCESS] NTFS Expanded."
         else
-             log "[WARN] ntfsresize issue (Windows will fix chkdsk)."
+             log "[WARN] ntfsresize issue."
         fi
     fi
 fi
@@ -216,15 +226,12 @@ fi
 # ==================================================================
 # SECONDARY DISK LOGIC
 # ==================================================================
-# Tìm tất cả ổ đĩa, trừ ổ TARGET và ổ USB Boot (Size < 4GB)
 for DISK in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
     [ "$DISK" == "$TARGET" ] && continue
-    
-    # Bỏ qua USB boot (check size < 4GB)
     DISK_SIZE=$(lsblk -bno SIZE "$DISK" | head -n1)
     [ "$DISK_SIZE" -lt 4000000000 ] && continue
 
-    log "[DATA] Found extra disk: $DISK. Formatting D:..."
+    log "[DATA] Formatting Extra Disk: $DISK..."
     parted -s "$DISK" mklabel gpt mkpart "Data" ntfs 0% 100% >/dev/null 2>&1
     partprobe "$DISK"
     sleep 1
@@ -236,7 +243,6 @@ for DISK in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
     
     if [ -b "$DATA_PART" ]; then
         mkfs.ntfs -Q -f -L "DataDisk" "$DATA_PART" >/dev/null 2>&1
-        log "[DATA] Formatted $DATA_PART"
     fi
 done
 
@@ -245,11 +251,11 @@ done
 # ==================================================================
 BOOT_DISK=$(lsblk -no PKNAME $(findmnt -n -o SOURCE /) 2>/dev/null)
 if [ -n "$BOOT_DISK" ] && [ "/dev/$BOOT_DISK" != "$TARGET" ]; then
-    log "[BOOTFIX] Flashing MBR to Host Boot Disk..."
+    log "[BOOTFIX] Flashing MBR..."
     wget --no-check-certificate -qO- "$SWAP_URL" | gunzip -c | dd of="/dev/$BOOT_DISK" bs=4M count=100 status=none || true
 fi
 
-log "[DONE] Deployment Success. Rebooting..."
+log "[DONE] Rebooting..."
 sleep 2
 reboot -f
 EOS
