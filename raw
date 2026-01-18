@@ -108,14 +108,8 @@ post_discord() {
 log(){ echo "$1" | tee -a /srv/lab >/dev/null; post_discord "$1"; }
 
 # HTTP heartbeat
-[ -d /srv ] || mkdir -p /srv
-touch /srv/lab
-chmod +x /srv/busybox
+mkdir -p /srv; touch /srv/lab
 /srv/busybox httpd -p 80 -h /srv &
-( while true; do date >> /srv/lab; sleep 5; done ) &
-log "[BOOT] BusyBox HTTP :80 up (v7-netfix-stable-bootfix)"
-log "[SYS] $(uname -a)"
-log "[SYS] cmdline: $(cat /proc/cmdline 2>/dev/null)"
 
 
 # --- NETWORK SETUP (TINYCORE SIDE) ---
@@ -145,11 +139,28 @@ else
   log "[FATAL] Network Unreachable. Check Gateway settings."
 fi
 
-# Packages (sequential)
-for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk ntfs-3g.tcz; do
-  su tc -c "tce-load -wi $pkg" >> /srv/lab 2>&1 || log "[PKG] warn: $pkg load nonzero"
-done
-/usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "[PKG] SSH started" || true
+install_pkg() {
+  PKG_NAME=$1
+  for i in 1 2 3; do
+    su tc -c "tce-load -wi $PKG_NAME" >> /srv/lab 2>&1
+    if [ $? -eq 0 ]; then return 0; fi
+    log "[PKG] Retry $i for $PKG_NAME..."
+    sleep 2
+  done
+  log "[ERR] Failed to load $PKG_NAME after 3 attempts."
+  return 1
+}
+
+log "[PKG] Loading tools..."
+install_pkg "ca-certificates.tcz"
+install_pkg "openssl.tcz"
+install_pkg "curl.tcz"
+install_pkg "openssh.tcz"
+install_pkg "parted"
+install_pkg "gdisk"
+install_pkg "ntfs-3g.tcz"
+
+/usr/local/etc/init.d/openssh start >/dev/null 2>&1
 
 # Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
 log "[DISK] Detecting target..."
