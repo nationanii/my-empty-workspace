@@ -1,286 +1,224 @@
 #!/bin/bash
 set -euo pipefail
 # =====================================================================
-# TinyCore Auto Windows Deployer
+# TinyCore Auto Windows Deployer v7-netfix-stable-bootfix
+# - DHCP thật với udhcpc (default.script), không -s /dev/null
+# - Tải image qua wget (theo redirect), stream gunzip | dd (BusyBox-safe)
+# - Theo dõi dd qua pidof + /proc/$pid/fdinfo/1 (offset), no infinite loop
+# - Chọn đĩa đích an toàn (ưu tiên /dev/sdb, tránh ghi lên disk đang boot)
+# - Unmount toàn bộ phân vùng của đĩa đích; sync+sleep trước khi dd
+# - Bootfix an toàn: nếu đĩa boot ≠ đĩa đích, ghi MBR/bootsector (SWAP_URL)
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # file .img.gz (có redirect OK)
 DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlvc-0CWC7VpM30bKr1ulMPUrCFZAUr7r06VPqFkbgCvCRbuyde_Ffc-0joff"
-SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
-BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
+SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
-# === 1. NETWORK DETECTION (HOST) =====================================
-echo "[HOST] Detecting Network..."
-MAIN_IF=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -n1)
-[ -z "$MAIN_IF" ] && MAIN_IF=$(ip -4 route show default | awk '{print $5}' | head -n1)
-
-MY_IP=$(ip -4 addr show "$MAIN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
-MY_GW=$(ip route | grep default | grep "$MAIN_IF" | awk '{print $3}' | head -n1)
-MY_DNS="8.8.8.8"
-
-if [ -z "$MAIN_IF" ] || [ -z "$MY_IP" ] || [ -z "$MY_GW" ]; then
-  echo "[FATAL] Network detection failed. Exiting."
-  exit 1
-fi
-
-echo "[HOST] NIC: $MAIN_IF | IP: $MY_IP | GW: $MY_GW"
-CMD_IP="STATIC_IP=${MY_IP} STATIC_GW=${MY_GW} STATIC_DNS=${MY_DNS}"
-
-# === 2. PREPARE TINYCORE ARTIFACTS ===================================
-TCE_MIRROR="http://tinycorelinux.net/14.x/x86_64/release/distribution_files"
+# === TINYCORE BOOT ARTIFACTS =========================================
+TCE_VERSION="14.x"
+ARCH="x86_64"
+TCE_MIRROR="http://tinycorelinux.net"
 BOOT_DIR="/boot/tinycore"
 WORKDIR="/tmp/tinycore_initrd"
+KERNEL_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/vmlinuz64"
+INITRD_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/corepure64.gz"
+KERNEL_PATH="$BOOT_DIR/vmlinuz64"
+INITRD_PATH="$BOOT_DIR/corepure64.gz"
+INITRD_PATCHED="$BOOT_DIR/corepure64-v7netfix-stable-bootfix.gz"
+BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
 
-echo "[SETUP] Installing dependencies..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get -y -qq update >/dev/null
-apt-get -y -qq install wget curl gzip cpio kexec-tools parted gdisk ca-certificates --no-install-recommends >/dev/null
+export NEEDRESTART_MODE=a
+echo 'kexec-tools kexec-tools/load_kexec boolean true' | debconf-set-selections
+
+echo "[1/6] Installing deps..."
+apt-get -y -qq update
+apt-get -y -qq install wget curl gzip cpio kexec-tools parted gdisk ca-certificates --no-install-recommends
 
 mkdir -p "$BOOT_DIR" "$WORKDIR"
 
-echo "[SETUP] Downloading TinyCore (Parallel)..."
-(wget -q -O "$BOOT_DIR/vmlinuz64" "$TCE_MIRROR/vmlinuz64") &
-(wget -q -O "$BOOT_DIR/corepure64.gz" "$TCE_MIRROR/corepure64.gz") &
-wait
+echo "[2/6] Fetch TinyCore kernel/initrd..."
+wget -q -O "$KERNEL_PATH" "$KERNEL_URL"
+wget -q -O "$INITRD_PATH" "$INITRD_URL"
 
-if [ ! -s "$BOOT_DIR/vmlinuz64" ] || [ ! -s "$BOOT_DIR/corepure64.gz" ]; then
-    echo "[FATAL] Download failed."
-    exit 1
-fi
-
-echo "[SETUP] Unpacking initrd..."
+echo "[3/6] Unpack initrd..."
 cd "$WORKDIR"
-gzip -dc "$BOOT_DIR/corepure64.gz" | cpio -idm --quiet
+gzip -dc "$INITRD_PATH" | cpio -idmv
 
-echo "[SETUP] Injecting scripts..."
-mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
+echo "[4/6] Inject bootlocal.sh + tools..."
+mkdir -p "$WORKDIR/srv"
+echo "pre-boot: initrd patched, waiting TinyCore..." > "$WORKDIR/srv/lab"
 wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL"
 chmod +x "$WORKDIR/srv/busybox"
 
-# === 3. INJECT BOOTLOCAL.SH (FIXED WEBHOOK) ==========================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOS'
 #!/bin/sh
-# TinyCore Internal Script v8.1-WebhookFix
 IMAGE_URL="__TC_GZ_LINK__"
 DISCORD_WEBHOOK="__TC_DISCORD__"
 SWAP_URL="__TC_SWAP_URL__"
-
-# --- ENV SETUP ---
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-mkdir -p /srv && touch /srv/lab
-/srv/busybox httpd -p 80 -h /srv &
 
-# --- 1. NETWORK & PACKAGES FIRST (CRITICAL FOR LOGGING) ---
-# Kích hoạt card mạng trước
-ip link set lo up
-ip link set eth0 up
-
-# Lấy IP tĩnh nếu có (để có mạng tải curl)
-for x in $(cat /proc/cmdline); do
-  case "$x" in
-    STATIC_IP=*) MIP="${x#*=}" ;;
-    STATIC_GW=*) MGW="${x#*=}" ;;
-    STATIC_DNS=*) MDNS="${x#*=}" ;;
-  esac
-done
-
-if [ -n "$MIP" ]; then
-  ip addr add "$MIP" dev eth0
-  ip route add default via "$MGW"
-  echo "nameserver $MDNS" > /etc/resolv.conf
-else
-  udhcpc -b -i eth0 -t 5 -T 3 >/dev/null 2>&1
-fi
-
-# Đợi mạng 1 chút
-sleep 3
-# Ping thử Google để kích hoạt route
-ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1
-
-# ==> CÀI CURL NGAY LẬP TỨC ĐỂ CÓ THỂ GỬI LOG <==
-# Load tạm wget của busybox để tải extension nếu tce-load fail (phòng hờ)
-tce-load -wi ca-certificates openssl curl >/dev/null 2>&1 || true
-
-# --- HELPER FUNCTIONS ---
 safe_echo() { echo "$1" | sed 's/"/\\"/g'; }
 post_discord() {
   [ -z "$DISCORD_WEBHOOK" ] && return 0
-  
-  # Kiểm tra xem curl đã có chưa, nếu chưa có thì thôi
-  if ! command -v curl >/dev/null; then return 0; fi
-
-  # Cắt nhỏ message để tránh lỗi limit 2000 char của Discord
-  echo "$1" | awk '{print substr($0,1,1800)}' | while read -r c; do
-    [ -z "$c" ] && continue
-    # Thêm -k để bỏ qua lỗi SSL (thường gặp ở TinyCore date sai giờ)
-    curl -k -m 5 -sS -H "Content-Type: application/json" \
-      -d "{\"content\":\"\`\`\`$(safe_echo "$c")\`\`\`\"}" \
-      "$DISCORD_WEBHOOK" >> /srv/lab 2>&1 || true
+  echo "$1" | awk -v max=1800 '{line=$0;while(length(line)>max){print substr(line,1,max);line=substr(line,max+1)}print line}' |
+  while read -r chunk; do
+    [ -z "$chunk" ] && continue
+    curl -m 5 -sS -H "Content-Type: application/json" \
+      -d "{\"content\":\"\`\`\`$(safe_echo "$chunk")\`\`\`\"}" \
+      "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+    sleep 0.2
   done
 }
 log(){ echo "$1" | tee -a /srv/lab >/dev/null; post_discord "$1"; }
 
-# --- START LOGIC ---
-log "[BOOT] Network & Curl ready. TinyCore v8.1 Started."
-if [ -n "$MIP" ]; then log "[NET] Mode: Static IP ($MIP)"; else log "[NET] Mode: DHCP"; fi
+# HTTP heartbeat
+[ -d /srv ] || mkdir -p /srv
+touch /srv/lab
+chmod +x /srv/busybox
+/srv/busybox httpd -p 80 -h /srv &
+( while true; do date >> /srv/lab; sleep 5; done ) &
+log "[BOOT] BusyBox HTTP :80 up (v7-netfix-stable-bootfix)"
+log "[SYS] $(uname -a)"
+log "[SYS] cmdline: $(cat /proc/cmdline 2>/dev/null)"
 
-# Load các tools còn lại
-log "[PKG] Loading disk tools (parted, gdisk, ntfs-3g)..."
-tce-load -wi openssh parted gdisk ntfs-3g >/dev/null 2>&1
-/usr/local/etc/init.d/openssh start >/dev/null 2>&1 &
-
-# --- DISK SELECTION ---
-TARGET=""
-for d in /dev/nvme0n1 /dev/vda /dev/sda; do
-  if [ -b "$d" ]; then TARGET="$d"; break; fi
+# Packages (sequential)
+for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk; do
+  su tc -c "tce-load -wi $pkg" >> /srv/lab 2>&1 || log "[PKG] warn: $pkg load nonzero"
 done
+/usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "[PKG] SSH started" || true
 
-[ -z "$TARGET" ] && { log "[FATAL] No disk found! Rebooting..."; sleep 5; reboot -f; }
-log "[DISK] Target: $TARGET"
+# Network: kill stale, real DHCP (default.script)
+if pidof udhcpc >/dev/null 2>&1; then killall -q udhcpc; sleep 1; fi
+FOUND_NIC=""
+ALL_IF="$(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+log "[NET] ifaces: $ALL_IF"
+for nic in $ALL_IF; do
+  [ "$nic" = "lo" ] && continue
+  case "$nic" in dummy*|tun*|tap*|sit*|veth*|virbr*|br-*|docker*) continue;; esac
+  ip link set "$nic" up 2>/dev/null
+  udhcpc -b -R -x hostname:tinycore -p "/var/run/udhcpc-$nic.pid" -i "$nic" >>/srv/lab 2>&1 || true
+  for s in 5 6 7 8 9 10 11 12 13 14 15; do
+    log "[NET] waiting DHCP on $nic (${s}s)"
+    ip -4 addr show dev "$nic" | grep -q 'inet ' && FOUND_NIC="$nic" && break
+    sleep 1
+  done
+  [ -n "$FOUND_NIC" ] && break
+done
+if [ -z "$FOUND_NIC" ]; then
+  log "[WARN] DHCP failed on all NICs, applying static IP eth0"
+  ip link set eth0 up 2>/dev/null
+  ip addr add 10.0.0.2/24 dev eth0 2>/dev/null
+  ip route add default via 10.0.0.1 2>/dev/null
+  echo "nameserver 1.1.1.1" > /etc/resolv.conf
+  FOUND_NIC="eth0"
+  log "[NET] Static 10.0.0.2 configured"
+else
+  log "[NET] IPv4 acquired on $FOUND_NIC"
+  ip -4 addr show dev "$FOUND_NIC" | sed 's/^/[IP] /' >> /srv/lab
+fi
 
-# Wipe & Unmount
-umount -f "${TARGET}"* 2>/dev/null
-swapoff -a
-dd if=/dev/zero of="$TARGET" bs=1M count=10 status=none
-sync
+# Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
+log "[DISK] Detecting target..."
+TARGET=""
+for d in /dev/sdb /dev/vdb /dev/nvme1n1 /dev/sda; do [ -b "$d" ] && TARGET="$d" && break; done
+[ -z "$TARGET" ] && TARGET="$(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | head -n1 | awk '{print "/dev/"$1}')"
+[ -z "$TARGET" ] && { log "[ERR] No disk. Rebooting in 3s..."; sleep 3; reboot -f; }
+log "[DISK] Using: $TARGET"
+lsblk "$TARGET" -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | sed 's/^/[LSBLK] /' >> /srv/lab
 
-# --- DOWNLOAD & WRITE (TURBO MODE) ---
-log "[IMG] Stream: $IMAGE_URL -> $TARGET (bs=64M)"
+# Unmount mọi phân vùng của TARGET
+for m in $(mount | awk -v t="$TARGET" '$1 ~ t{print $3}'); do
+  umount -f "$m" 2>/dev/null || true
+done
+sync; sleep 3
+
+# Xác định boot-disk (đĩa hiện chứa /boot hoặc root)
+BOOTDISK="$(lsblk -no PKNAME "$(readlink -f /dev/root 2>/dev/null || echo /dev/sda)" 2>/dev/null | sed 's#^#/dev/#')"
+[ -z "$BOOTDISK" ] && BOOTDISK="/dev/sda"
+log "[DISK] Boot-disk guessed: $BOOTDISK"
+
+# Debug redirect chain (không fail nếu lỗi)
+log "[IMG] Checking redirect chain (wget --spider -S)..."
+wget --no-check-certificate --max-redirect=20 -S --spider "$IMAGE_URL" 2>>/srv/lab >/dev/null || true
+
+# --- STREAM IMAGE: wget | gunzip | dd (BusyBox-safe, no infinite loop) ---
+log "[IMG] Start streaming: wget -> gunzip -> dd"
+log "[IMG] PIPE: wget -S -O- \"$IMAGE_URL\" | gunzip -c | dd of=\"$TARGET\" bs=4M conv=fsync"
+
 (
-  wget --no-check-certificate -qO- "$IMAGE_URL" \
+  wget --no-check-certificate -S -O- "$IMAGE_URL" 2>>/srv/lab \
   | gunzip -c \
-  | dd of="$TARGET" bs=64M conv=fsync status=none
+  | dd of="$TARGET" bs=4M conv=fsync 2>>/srv/lab
 ) &
 PIPE_PID=$!
 
-# Monitor loop
-start_ts=$(date +%s)
+# monitor dd progress bằng offset (fdinfo)
+i=0
 while kill -0 "$PIPE_PID" 2>/dev/null; do
-  sleep 10
-  curr_ts=$(date +%s)
-  # Gửi log tiến độ mỗi 10s (chỉ ghi vào file local để đỡ spam Discord)
-  echo "[IMG] Running... $((curr_ts - start_ts))s" >> /srv/lab
+  PID_DD="$(pidof dd 2>/dev/null | awk '{print $1}')"
+  if [ -n "$PID_DD" ] && [ -r "/proc/$PID_DD/fdinfo/1" ]; then
+    OFFSET="$(awk '/pos:/{print $2}' /proc/$PID_DD/fdinfo/1 2>/dev/null | head -n1)"
+    [ -z "$OFFSET" ] && OFFSET=0
+    echo "[IMG] Installing... (${i}s, offset=$OFFSET)" >>/srv/lab
+  else
+    echo "[IMG] Installing... (${i}s)" >>/srv/lab
+  fi
+  sleep 5; i=$((i+5))
 done
 
+# lấy exit code của pipeline (dd là tiến trình cuối cùng trả rc)
 wait "$PIPE_PID"
-if [ "$?" -ne 0 ]; then
-  log "[FATAL] Pipeline failed. Rebooting..."
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  log "[ERR] dd/wget pipeline failed (rc=$RC). Dump tail logs."
+  tail -n 50 /srv/lab >>/srv/lab
   reboot -f
 fi
 
-# ==================================================================
-# SMART EXPAND LOGIC
-# ==================================================================
-log "[EXPAND] Image written. Optimizing partitions..."
-partprobe "$TARGET" || true
-sleep 1
+sync
+partprobe "$TARGET" 2>/dev/null || true
+lsblk "$TARGET" -o NAME,SIZE,TYPE 2>/dev/null | sed 's/^/[POST] /' >> /srv/lab
+log "[OK] Image deployed to $TARGET in ${i}s"
 
-# 1. Fix GPT Header
-sgdisk -e "$TARGET" >/dev/null 2>&1 || true
-partprobe "$TARGET"
-sleep 1
-
-# 2. Xóa Recovery/OEM
-for loop in 1 2; do
-    LAST_INFO=$(parted -m "$TARGET" unit MB print 2>/dev/null | tail -n 1 | grep -v "BYT")
-    LAST_NUM=$(echo "$LAST_INFO" | cut -d: -f1)
-    LAST_SIZE=$(echo "$LAST_INFO" | cut -d: -f4 | tr -d 'MB' | cut -d. -f1)
-
-    if [ -n "$LAST_NUM" ] && [ "$LAST_SIZE" -lt 2048 ]; then
-        log "[EXPAND] Removing partition #$LAST_NUM (${LAST_SIZE}MB)"
-        parted -s "$TARGET" rm "$LAST_NUM" >/dev/null 2>&1
-        partprobe "$TARGET"
-        sleep 1
-    else
-        break
-    fi
-done
-
-# 3. Resize ổ C
-TARGET_PART=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | cut -d: -f1)
-
-if [ -n "$TARGET_PART" ]; then
-    log "[EXPAND] Expanding Partition #$TARGET_PART..."
-    parted -s "$TARGET" resizepart "$TARGET_PART" 100% >/dev/null 2>&1
-    partprobe "$TARGET"
-    sleep 1
-    
-    case "$TARGET" in
-        *[0-9]) PART_DEV="${TARGET}p${TARGET_PART}" ;;
-        *)      PART_DEV="${TARGET}${TARGET_PART}"   ;;
-    esac
-
-    if [ -b "$PART_DEV" ]; then
-        ntfsfix -b -d "$PART_DEV" >/dev/null 2>&1 || true
-        if ntfsresize -f -b "$PART_DEV" >/dev/null 2>&1; then
-             log "[SUCCESS] NTFS Expanded."
-        else
-             log "[WARN] ntfsresize issue."
-        fi
-    fi
+# --- BOOTFIX (chỉ khi boot-disk khác với TARGET) ---
+if [ "$BOOTDISK" != "$TARGET" ] && [ -b "$BOOTDISK" ]; then
+  log "[BOOTFIX] Applying boot sector from SWAP_URL to $BOOTDISK (not target)"
+  wget --no-check-certificate -O /tmp/grub.gz "$SWAP_URL" >>/srv/lab 2>&1 || true
+  if [ -s /tmp/grub.gz ]; then
+    gunzip -c /tmp/grub.gz | dd of="$BOOTDISK" bs=4M 2>>/srv/lab || true
+    sync
+    log "[BOOTFIX] MBR/bootsector written to $BOOTDISK"
+  else
+    log "[BOOTFIX] Failed to download grub.gz"
+  fi
+else
+  log "[BOOTFIX] Skipped (boot-disk == target or boot-disk missing)"
 fi
 
-# ==================================================================
-# SECONDARY DISK LOGIC
-# ==================================================================
-for DISK in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
-    [ "$DISK" == "$TARGET" ] && continue
-    DISK_SIZE=$(lsblk -bno SIZE "$DISK" | head -n1)
-    [ "$DISK_SIZE" -lt 4000000000 ] && continue
-
-    log "[DATA] Formatting Extra Disk: $DISK..."
-    parted -s "$DISK" mklabel gpt mkpart "Data" ntfs 0% 100% >/dev/null 2>&1
-    partprobe "$DISK"
-    sleep 1
-    
-    case "$DISK" in
-        *[0-9]) DATA_PART="${DISK}p1" ;;
-        *)      DATA_PART="${DISK}1"   ;;
-    esac
-    
-    if [ -b "$DATA_PART" ]; then
-        mkfs.ntfs -Q -f -L "DataDisk" "$DATA_PART" >/dev/null 2>&1
-    fi
-done
-
-# ==================================================================
-# BOOT FIX & REBOOT
-# ==================================================================
-BOOT_DISK=$(lsblk -no PKNAME $(findmnt -n -o SOURCE /) 2>/dev/null)
-if [ -n "$BOOT_DISK" ] && [ "/dev/$BOOT_DISK" != "$TARGET" ]; then
-    log "[BOOTFIX] Flashing MBR..."
-    wget --no-check-certificate -qO- "$SWAP_URL" | gunzip -c | dd of="/dev/$BOOT_DISK" bs=4M count=100 status=none || true
-fi
-
-log "[DONE] Rebooting..."
-sleep 2
+sleep 3
+log "[SYS] Rebooting..."
 reboot -f
 EOS
 
-# === 4. FINALIZE & KEXEC =============================================
-# Inject Variables
-sed -i "s|__TC_GZ_LINK__|${GZ_LINK}|g" "$WORKDIR/opt/bootlocal.sh"
-sed -i "s|__TC_DISCORD__|${DISCORD_WEBHOOK}|g" "$WORKDIR/opt/bootlocal.sh"
-sed -i "s|__TC_SWAP_URL__|${SWAP_URL}|g" "$WORKDIR/opt/bootlocal.sh"
+# Inject runtime vars
+sed -i "s#__TC_GZ_LINK__#${GZ_LINK}#g"   "$WORKDIR/opt/bootlocal.sh"
+sed -i "s#__TC_DISCORD__#${DISCORD_WEBHOOK}#g" "$WORKDIR/opt/bootlocal.sh"
+sed -i "s#__TC_SWAP_URL__#${SWAP_URL}#g" "$WORKDIR/opt/bootlocal.sh"
 chmod +x "$WORKDIR/opt/bootlocal.sh"
 
-# Auto-start
-echo "/opt/bootlocal.sh &" >> "$WORKDIR/etc/init.d/tc-config"
+# Ensure autorun
+grep -q "/opt/bootlocal.sh" "$WORKDIR/etc/init.d/tc-config" || echo "/opt/bootlocal.sh &" >> "$WORKDIR/etc/init.d/tc-config"
 
-echo "[SETUP] Repacking initrd (Fast Mode)..."
-# Dùng gzip -1 để nén nhanh hơn
-find . | cpio -o -H newc --quiet | gzip -1 > "$BOOT_DIR/corepure64-custom.gz"
+echo "[5/6] Repack initrd..."
+find . | cpio -o -H newc | gzip -c > "$INITRD_PATCHED"
 
-echo "[EXEC] Kexec TinyCore..."
-CMDLINE="console=ttyS0 quiet loglevel=3 net.ifnames=0 biosdevname=0 $CMD_IP"
-
-kexec -l "$BOOT_DIR/vmlinuz64" \
-      --initrd="$BOOT_DIR/corepure64-custom.gz" \
-      --command-line="$CMDLINE"
-
+echo "[6/6] Kexec TinyCore..."
+CMDLINE="console=ttyS0 quiet"
+kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"
 echo "===================================================="
-echo "🚀 TinyCore 8."
-echo "ok bye"
+echo "🚀 TinyCore v7-netfix-stable-bootfix: safe target + real DHCP + wget|gunzip|dd + bootfix"
 echo "===================================================="
+sleep 2
 kexec -e
