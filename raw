@@ -262,7 +262,7 @@ done
         # Bước quan trọng: Resize 
         log "[NTFS] Expanding filesystem..."
         # -f: force, -v: verbose. Chấp nhận rủi ro để expand
-        if ntfsresize -f -v "$PART_DEV" >> /srv/lab 2>&1; then
+        if ntfsresize -f -f -v "$PART_DEV" >> /srv/lab 2>&1; then
             log "[SUCCESS] NTFS Expanded via Linux!"
             parted -s /dev/nvme1n1 mklabel gpt
             parted -s /dev/nvme1n1 mkpart "Data" ntfs 0% 100%
