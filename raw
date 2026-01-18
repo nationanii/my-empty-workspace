@@ -108,8 +108,15 @@ post_discord() {
 log(){ echo "$1" | tee -a /srv/lab >/dev/null; post_discord "$1"; }
 
 # HTTP heartbeat
-mkdir -p /srv; touch /srv/lab
+[ -d /srv ] || mkdir -p /srv
+touch /srv/lab
+chmod +x /srv/busybox
 /srv/busybox httpd -p 80 -h /srv &
+( while true; do date >> /srv/lab; sleep 5; done ) &
+log "[BOOT] BusyBox HTTP :80 up (v7-netfix-stable-bootfix)"
+log "[SYS] $(uname -a)"
+log "[SYS] cmdline: $(cat /proc/cmdline 2>/dev/null)"
+
 
 
 # --- NETWORK SETUP (TINYCORE SIDE) ---
