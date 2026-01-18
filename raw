@@ -117,11 +117,6 @@ log "[BOOT] BusyBox HTTP :80 up (v7-netfix-stable-bootfix)"
 log "[SYS] $(uname -a)"
 log "[SYS] cmdline: $(cat /proc/cmdline 2>/dev/null)"
 
-# Packages (sequential)
-for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk ntfs-3g.tcz; do
-  su tc -c "tce-load -wi $pkg" >> /srv/lab 2>&1 || log "[PKG] warn: $pkg load nonzero"
-done
-/usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "[PKG] SSH started" || true
 
 # --- NETWORK SETUP (TINYCORE SIDE) ---
 # Trong TinyCore mới boot (RAM), Docker KHÔNG tồn tại.
@@ -149,6 +144,12 @@ if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
 else 
   log "[FATAL] Network Unreachable. Check Gateway settings."
 fi
+
+# Packages (sequential)
+for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted gdisk ntfs-3g.tcz; do
+  su tc -c "tce-load -wi $pkg" >> /srv/lab 2>&1 || log "[PKG] warn: $pkg load nonzero"
+done
+/usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "[PKG] SSH started" || true
 
 # Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
 log "[DISK] Detecting target..."
