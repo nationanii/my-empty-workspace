@@ -1,11 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 # =====================================================================
-# TinyCore Auto Windows Deployer v19-Ultimate
-# - Network: Auto-detect from DPCT host (passthrough/bridge)
-# - Deploy: Stream wget|gunzip|dd với progress monitoring
-# - Auto-Expand: NTFS resize với force mode (-f -f)
-# - Safety: Smart disk detection, unmount, bootfix
+# TinyCore Auto Windows Deployer v20-DiskFix
+# - FIXED: Robust disk detection với nhiều fallback strategies
+# - Network: Auto-detect từ DPCT host
+# - Auto-Expand: NTFS resize force mode
 # =====================================================================
 
 # === USER CONFIG =====================================================
@@ -13,7 +12,7 @@ GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"
 DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlvc-0CWC7VpM30bKr1ulMPUrCFZAUr7r06VPqFkbgCvCRbuyde_Ffc-0joff"
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
-# === NETWORK AUTO-DETECT (từ host) ===================================
+# === NETWORK AUTO-DETECT =============================================
 echo "[NETWORK] Detecting host network configuration..."
 MAIN_IF=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -n1 || echo "")
 if [ -n "$MAIN_IF" ]; then
@@ -34,19 +33,14 @@ else
 fi
 
 # === TINYCORE CONFIGURATION ==========================================
-TCE_VERSION="14.x"
-ARCH="x86_64"
-TCE_MIRROR="http://tinycorelinux.net"
+TCE_MIRROR="http://tinycorelinux.net/14.x/x86_64"
 BOOT_DIR="/boot/tinycore"
 WORKDIR="/tmp/tinycore_initrd"
-KERNEL_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/vmlinuz64"
-INITRD_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/corepure64.gz"
 KERNEL_PATH="$BOOT_DIR/vmlinuz64"
 INITRD_PATH="$BOOT_DIR/corepure64.gz"
-INITRD_PATCHED="$BOOT_DIR/corepure64-v19-ultimate.gz"
+INITRD_PATCHED="$BOOT_DIR/corepure64-v20-diskfix.gz"
 BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
 
-# === ENVIRONMENT SETUP ===============================================
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 echo 'kexec-tools kexec-tools/load_kexec boolean true' | debconf-set-selections
@@ -61,15 +55,15 @@ apt-get -y -qq install wget curl gzip cpio kexec-tools parted gdisk \
 mkdir -p "$BOOT_DIR" "$WORKDIR"
 
 log_msg "=== Phase 2/6: Fetching TinyCore artifacts ==="
-wget -q -O "$KERNEL_PATH" "$KERNEL_URL"
-wget -q -O "$INITRD_PATH" "$INITRD_URL"
+wget -q -O "$KERNEL_PATH" "$TCE_MIRROR/release/distribution_files/vmlinuz64"
+wget -q -O "$INITRD_PATH" "$TCE_MIRROR/release/distribution_files/corepure64.gz"
 log_msg "Kernel: $(du -h "$KERNEL_PATH" | cut -f1)"
 log_msg "Initrd: $(du -h "$INITRD_PATH" | cut -f1)"
 
 log_msg "=== Phase 3/6: Unpacking initrd ==="
 cd "$WORKDIR"
 gzip -dc "$INITRD_PATH" | cpio -idm 2>/dev/null
-log_msg "Initrd unpacked successfully"
+log_msg "Initrd unpacked"
 
 log_msg "=== Phase 4/6: Injecting deployment script ==="
 mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
@@ -79,14 +73,14 @@ chmod +x "$WORKDIR/srv/busybox"
 cat > "$WORKDIR/opt/bootlocal.sh" <<'BOOTLOCAL_SCRIPT'
 #!/bin/sh
 # =============================================================================
-# TinyCore Windows Deployment Script v19-Ultimate
+# TinyCore Windows Deployment Script v20-DiskFix
 # =============================================================================
 IMAGE_URL="__TC_GZ_LINK__"
 DISCORD_WEBHOOK="__TC_DISCORD__"
 SWAP_URL="__TC_SWAP_URL__"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Parse network config from kernel cmdline
+# Parse network config
 for x in $(cat /proc/cmdline); do
   case "$x" in
     STATIC_IP=*) MANUAL_IP="${x#*=}" ;;
@@ -122,51 +116,46 @@ log() {
   post_discord "$msg"
 }
 
-# === HTTP SERVER =====================================================
+# === SETUP ===========================================================
 mkdir -p /srv; touch /srv/lab
-chmod +x /srv/busybox 2>/dev/null || true
-/srv/busybox httpd -p 80 -h /srv 2>/dev/null && log "✓ HTTP server :80" || log "⚠ HTTP failed"
+chmod +x /srv/busybox 2>/dev/null
+/srv/busybox httpd -p 80 -h /srv 2>/dev/null && log "✓ HTTP :80" || log "⚠ HTTP failed"
 
 ( while true; do echo "[HEARTBEAT] $(date)" >> /srv/lab; sleep 10; done ) &
 
 log "=========================================="
-log "TinyCore Deployer v19-Ultimate"
+log "TinyCore Deployer v20-DiskFix"
 log "=========================================="
 log "System: $(uname -sr)"
 log "Memory: $(free -m | awk 'NR==2{printf "%sMB/%sMB", $3,$2}')"
 
-# === PACKAGE INSTALLATION ============================================
+# === PACKAGES ========================================================
 install_pkg() {
   for attempt in 1 2 3; do
     if su tc -c "tce-load -wi $1" >> /srv/lab 2>&1; then
-      log "✓ $1 loaded"
+      log "✓ $1"
       return 0
     fi
     sleep 2
   done
-  log "⚠ $1 load failed (continuing)"
+  log "⚠ $1 failed"
   return 1
 }
 
 log "Loading packages..."
-install_pkg "ca-certificates.tcz"
-install_pkg "openssl.tcz"
-install_pkg "curl.tcz"
-install_pkg "openssh.tcz"
-install_pkg "parted.tcz"
-install_pkg "gdisk.tcz"
-install_pkg "ntfs-3g.tcz"
+for pkg in ca-certificates.tcz openssl.tcz curl.tcz openssh.tcz parted.tcz gdisk.tcz ntfs-3g.tcz; do
+  install_pkg "$pkg"
+done
 
 /usr/local/etc/init.d/openssh start >/dev/null 2>&1 && log "✓ SSH started" || true
 
-# === NETWORK SETUP ===================================================
+# === NETWORK =========================================================
 log "Configuring network..."
 ifconfig lo up
 
-# Try manual config first (from host)
 NETWORK_UP=0
 if [ -n "$MANUAL_IP" ]; then
-  log "Using static config from host: $MANUAL_IP"
+  log "Using static config: $MANUAL_IP"
   ip link set eth0 up
   ip addr flush dev eth0
   ip addr add "$MANUAL_IP" dev eth0
@@ -176,124 +165,246 @@ if [ -n "$MANUAL_IP" ]; then
   if ip -4 addr show dev eth0 | grep -q 'inet '; then
     NETWORK_UP=1
     log "✓ Static IP configured"
-    ip -4 addr show dev eth0 | sed 's/^/  /' >> /srv/lab
   fi
 fi
 
-# Fallback to DHCP
 if [ "$NETWORK_UP" -eq 0 ]; then
-  log "Trying DHCP on eth0..."
+  log "Trying DHCP..."
   ip link set eth0 up
-  udhcpc -b -i eth0 -t 8 -T 2 -A 3 >> /srv/lab 2>&1 || true
+  udhcpc -b -i eth0 -t 8 -T 2 >> /srv/lab 2>&1 || true
   
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if ip -4 addr show dev eth0 | grep -q 'inet '; then
       NETWORK_UP=1
-      log "✓ DHCP acquired on eth0"
-      ip -4 addr show dev eth0 | sed 's/^/  /' >> /srv/lab
+      log "✓ DHCP acquired"
       break
     fi
     sleep 1
   done
 fi
 
-if [ "$NETWORK_UP" -eq 0 ]; then
-  log "⚠ WARNING: No network configured"
-  log "Deployment may fail without network!"
-fi
+[ "$NETWORK_UP" -eq 0 ] && log "⚠ No network (may fail)"
+ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1 && log "✓ Internet OK" || log "⚠ No internet"
 
-# Test connectivity
-if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
-  log "✓ Internet connectivity OK"
-else
-  log "⚠ No internet connectivity"
-fi
+# === IMPROVED DISK DETECTION =========================================
+log "=========================================="
+log "Disk Detection (Enhanced)"
+log "=========================================="
 
-# === DISK DETECTION ==================================================
-log "Detecting target disk..."
+# Step 1: Detect boot disk first
+log "Step 1: Detecting boot disk..."
+BOOT_DEVICE=""
+BOOTDISK=""
 
-TARGET=""
-# Prefer non-boot disks first
-for disk in /dev/sdb /dev/vdb /dev/nvme1n1 /dev/sda /dev/vda /dev/nvme0n1; do
-  if [ -b "$disk" ]; then
-    TARGET="$disk"
-    break
-  fi
+# Try multiple methods to find boot device
+for method in "/dev/root" "/proc/cmdline" "/sys/block"; do
+  case "$method" in
+    "/dev/root")
+      if [ -L /dev/root ]; then
+        BOOT_DEVICE=$(readlink -f /dev/root 2>/dev/null)
+        [ -n "$BOOT_DEVICE" ] && log "  Method 1: /dev/root -> $BOOT_DEVICE" && break
+      fi
+      ;;
+    "/proc/cmdline")
+      ROOT_PARAM=$(cat /proc/cmdline | grep -oP 'root=\K\S+' | head -n1)
+      if [ -n "$ROOT_PARAM" ]; then
+        if [ -b "$ROOT_PARAM" ]; then
+          BOOT_DEVICE="$ROOT_PARAM"
+          log "  Method 2: cmdline root=$BOOT_DEVICE"
+          break
+        fi
+      fi
+      ;;
+    "/sys/block")
+      # Find device mounted on /
+      BOOT_DEVICE=$(mount | awk '$3=="/" {print $1}' | head -n1)
+      [ -n "$BOOT_DEVICE" ] && log "  Method 3: mounted on / -> $BOOT_DEVICE" && break
+      ;;
+  esac
 done
 
-# Fallback
-if [ -z "$TARGET" ]; then
-  TARGET=$(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print "/dev/"$1; exit}')
+# Extract parent disk from boot device
+if [ -n "$BOOT_DEVICE" ]; then
+  # Handle different device naming schemes
+  case "$BOOT_DEVICE" in
+    /dev/nvme*)
+      # nvme0n1p1 -> nvme0n1
+      BOOTDISK=$(echo "$BOOT_DEVICE" | sed 's/p[0-9]*$//')
+      ;;
+    /dev/mmcblk*)
+      # mmcblk0p1 -> mmcblk0
+      BOOTDISK=$(echo "$BOOT_DEVICE" | sed 's/p[0-9]*$//')
+      ;;
+    /dev/sd*|/dev/vd*|/dev/hd*)
+      # sda1 -> sda
+      BOOTDISK=$(echo "$BOOT_DEVICE" | sed 's/[0-9]*$//')
+      ;;
+    *)
+      # Generic: try lsblk
+      BOOTDISK=$(lsblk -no PKNAME "$BOOT_DEVICE" 2>/dev/null | sed 's#^#/dev/#' | head -n1)
+      ;;
+  esac
 fi
 
-if [ -z "$TARGET" ] || [ ! -b "$TARGET" ]; then
-  log "✗ ERROR: No disk found. Rebooting..."
-  sleep 5
+# Fallback: assume /dev/sda
+[ -z "$BOOTDISK" ] && BOOTDISK="/dev/sda"
+log "Boot disk: $BOOTDISK"
+
+# Step 2: List all available disks
+log "Step 2: Scanning for available disks..."
+ALL_DISKS=""
+
+# Method 1: lsblk
+if command -v lsblk >/dev/null 2>&1; then
+  ALL_DISKS=$(lsblk -dpno NAME,TYPE,SIZE 2>/dev/null | awk '$2=="disk"{print $1":"$3}')
+fi
+
+# Method 2: /sys/block (fallback)
+if [ -z "$ALL_DISKS" ]; then
+  for disk in /sys/block/sd* /sys/block/vd* /sys/block/nvme* /sys/block/hd*; do
+    [ -e "$disk" ] || continue
+    DISK_NAME="/dev/$(basename "$disk")"
+    [ -b "$DISK_NAME" ] && ALL_DISKS="$ALL_DISKS $DISK_NAME:unknown"
+  done
+fi
+
+# Method 3: Direct device probe (last resort)
+if [ -z "$ALL_DISKS" ]; then
+  for disk in /dev/sda /dev/sdb /dev/sdc /dev/sdd /dev/vda /dev/vdb /dev/nvme0n1 /dev/nvme1n1; do
+    [ -b "$disk" ] && ALL_DISKS="$ALL_DISKS $disk:unknown"
+  done
+fi
+
+if [ -z "$ALL_DISKS" ]; then
+  log "✗ FATAL: No disks found at all!"
+  log "Debug: Listing /dev:"
+  ls -la /dev/sd* /dev/vd* /dev/nvme* /dev/hd* 2>/dev/null | sed 's/^/  /' >> /srv/lab
+  log "Rebooting in 15 seconds..."
+  sleep 15
   reboot -f
 fi
 
-log "Target disk: $TARGET"
-lsblk "$TARGET" -o NAME,SIZE,TYPE,FSTYPE 2>/dev/null | sed 's/^/  /' >> /srv/lab
-
-DISK_SIZE_GB=$(lsblk -bno SIZE "$TARGET" 2>/dev/null | awk '{printf "%.1f", $1/1024/1024/1024}')
-log "Disk size: ${DISK_SIZE_GB}GB"
-
-# === UNMOUNT & PREPARE ===============================================
-log "Preparing disk..."
-
-# Unmount all partitions
-for mnt in $(mount | awk -v t="$TARGET" '$1 ~ t {print $3}'); do
-  umount -f "$mnt" 2>/dev/null && log "✓ Unmounted: $mnt" || true
+log "Found disks:"
+echo "$ALL_DISKS" | tr ' ' '\n' | while read -r disk_info; do
+  [ -z "$disk_info" ] && continue
+  log "  - $disk_info"
 done
+
+# Step 3: Select target disk (prefer non-boot)
+log "Step 3: Selecting target disk..."
+TARGET=""
+
+# Strategy 1: Find first non-boot disk
+CANDIDATE_ORDER="sdb vdb nvme1n1 sdc vdc sdd nvme2n1 sda vda nvme0n1"
+for candidate in $CANDIDATE_ORDER; do
+  DISK_PATH="/dev/$candidate"
+  
+  # Check if disk exists
+  [ ! -b "$DISK_PATH" ] && continue
+  
+  # Check if it's the boot disk
+  if [ "$DISK_PATH" = "$BOOTDISK" ]; then
+    log "  Skipping boot disk: $DISK_PATH"
+    continue
+  fi
+  
+  # Found good candidate!
+  TARGET="$DISK_PATH"
+  log "  Selected (non-boot): $TARGET ✓"
+  break
+done
+
+# Strategy 2: If no non-boot disk, use boot disk
+if [ -z "$TARGET" ]; then
+  log "  No separate disk found, using boot disk"
+  TARGET="$BOOTDISK"
+  log "  Selected (boot disk): $TARGET ⚠"
+fi
+
+# Strategy 3: Last resort - first available disk
+if [ -z "$TARGET" ] || [ ! -b "$TARGET" ]; then
+  TARGET=$(echo "$ALL_DISKS" | awk '{print $1}' | cut -d: -f1 | head -n1)
+  log "  Fallback to first available: $TARGET"
+fi
+
+# Final validation
+if [ -z "$TARGET" ] || [ ! -b "$TARGET" ]; then
+  log "✗ FATAL: Could not select target disk!"
+  log "Boot disk: $BOOTDISK"
+  log "All disks: $ALL_DISKS"
+  log "Rebooting in 15 seconds..."
+  sleep 15
+  reboot -f
+fi
+
+log "=========================================="
+log "FINAL TARGET: $TARGET"
+log "=========================================="
+
+# Display target disk info
+lsblk "$TARGET" -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | sed 's/^/  /' >> /srv/lab
+
+# Get size
+DISK_SIZE_BYTES=$(lsblk -bno SIZE "$TARGET" 2>/dev/null | head -n1)
+if [ -n "$DISK_SIZE_BYTES" ]; then
+  DISK_SIZE_GB=$(echo "$DISK_SIZE_BYTES" | awk '{printf "%.1f", $1/1024/1024/1024}')
+  log "Disk size: ${DISK_SIZE_GB} GB"
+  
+  # Warn if too small
+  if [ "$DISK_SIZE_BYTES" -lt 10737418240 ]; then
+    log "⚠ WARNING: Disk < 10GB! Windows may not fit."
+  fi
+else
+  log "⚠ Could not determine size"
+fi
+
+# === PREPARE DISK ====================================================
+log "Preparing disk for deployment..."
+
+# Unmount all partitions on target
+UNMOUNTED=0
+for mnt in $(mount | awk -v t="$TARGET" '$1 ~ t {print $3}'); do
+  if umount -f "$mnt" 2>/dev/null; then
+    log "✓ Unmounted: $mnt"
+    UNMOUNTED=$((UNMOUNTED + 1))
+  fi
+done
+[ "$UNMOUNTED" -gt 0 ] && log "Unmounted $UNMOUNTED partition(s)"
 
 # Disable swap
 swapoff -a 2>/dev/null || true
 
-# Wipe first 10MB (partition table)
+# Wipe partition table (10MB)
+log "Wiping partition table..."
 dd if=/dev/zero of="$TARGET" bs=1M count=10 conv=fsync 2>/dev/null || true
 sync
 sleep 2
 
-# Detect boot disk
-BOOT_DEVICE=$(readlink -f /dev/root 2>/dev/null || echo '')
-if [ -n "$BOOT_DEVICE" ]; then
-  BOOTDISK=$(lsblk -no PKNAME "$BOOT_DEVICE" 2>/dev/null | sed 's#^#/dev/#')
-else
-  BOOTDISK="/dev/sda"
-fi
-[ -z "$BOOTDISK" ] && BOOTDISK="/dev/sda"
-log "Boot disk: $BOOTDISK"
-
-# === IMAGE DEPLOYMENT ================================================
+# === DEPLOYMENT ======================================================
 log "=========================================="
-log "Starting image deployment"
+log "Starting deployment"
 log "=========================================="
 log "Source: $IMAGE_URL"
 log "Target: $TARGET"
 
 START_TIME=$(date +%s)
 
-# Stream deployment
-log "Pipeline: curl -> gunzip -> dd"
-
 (
   curl -L -k -f --progress-bar "$IMAGE_URL" 2>&1 \
-  | tee >(grep -o '[0-9]*\.[0-9]*%' >> /srv/curl_progress) \
   | gunzip -c \
-  | dd of="$TARGET" bs=64M conv=fsync oflag=direct 2>&1 \
+  | dd of="$TARGET" bs=4M conv=fsync oflag=direct 2>&1 \
   | tee -a /srv/lab
 ) &
 
 PIPE_PID=$!
 log "Deployment started (PID: $PIPE_PID)"
 
-# Monitor progress
+# Monitor
 LAST_OFFSET=0
 CHECK_INTERVAL=5
 
 while kill -0 "$PIPE_PID" 2>/dev/null; do
   ELAPSED=$(($(date +%s) - START_TIME))
-  
   DD_PID=$(pidof dd 2>/dev/null | awk '{print $1}')
   
   if [ -n "$DD_PID" ] && [ -r "/proc/$DD_PID/fdinfo/1" ]; then
@@ -301,15 +412,10 @@ while kill -0 "$PIPE_PID" 2>/dev/null; do
     [ -z "$OFFSET" ] && OFFSET=0
     
     OFFSET_MB=$((OFFSET / 1024 / 1024))
+    SPEED_MBS=0
+    [ "$OFFSET" -gt "$LAST_OFFSET" ] && SPEED_MBS=$(((OFFSET - LAST_OFFSET) / CHECK_INTERVAL / 1024 / 1024))
     
-    if [ "$OFFSET" -gt "$LAST_OFFSET" ]; then
-      DIFF=$((OFFSET - LAST_OFFSET))
-      SPEED_MBS=$((DIFF / CHECK_INTERVAL / 1024 / 1024))
-    else
-      SPEED_MBS=0
-    fi
-    
-    log "Progress: ${OFFSET_MB}MB | Speed: ${SPEED_MBS}MB/s | Time: ${ELAPSED}s"
+    log "Progress: ${OFFSET_MB}MB | ${SPEED_MBS}MB/s | ${ELAPSED}s"
     LAST_OFFSET=$OFFSET
   else
     log "Deploying... (${ELAPSED}s)"
@@ -323,8 +429,7 @@ RC=$?
 TOTAL_TIME=$(($(date +%s) - START_TIME))
 
 if [ "$RC" -ne 0 ]; then
-  log "✗ ERROR: Deployment failed (exit code: $RC)"
-  log "Total time: ${TOTAL_TIME}s"
+  log "✗ ERROR: Deploy failed (rc=$RC)"
   tail -50 /srv/lab >> /srv/lab
   sleep 5
   reboot -f
@@ -332,40 +437,34 @@ fi
 
 sync
 sleep 2
+log "✓ Deploy OK (${TOTAL_TIME}s)"
 
-log "✓ Deployment successful in ${TOTAL_TIME}s"
-
-# === AUTO-EXPAND NTFS ================================================
+# === AUTO-EXPAND =====================================================
 log "=========================================="
-log "Auto-Expand: Fixing GPT & Resizing NTFS"
+log "Auto-Expand NTFS"
 log "=========================================="
 
-# Fix GPT (expand to full disk)
-log "Fixing GPT table..."
+log "Fixing GPT..."
 sgdisk -e "$TARGET" >> /srv/lab 2>&1 || true
 partprobe "$TARGET" 2>/dev/null || true
 sleep 3
 
-# Get last partition number
 LAST_PART=$(parted -m "$TARGET" print 2>/dev/null | tail -n 1 | awk -F: '{print $1}')
 log "Last partition: #$LAST_PART"
 
-# Delete recovery partition if exists (usually partition 3 or 4)
+# Delete recovery if needed
 if [ -n "$LAST_PART" ] && [ "$LAST_PART" -ge 3 ]; then
   PART_TYPE=$(parted -m "$TARGET" print 2>/dev/null | grep "^${LAST_PART}:" | awk -F: '{print $5}')
-  log "Partition #$LAST_PART type: $PART_TYPE"
-  
-  # Check if it's recovery partition (usually < 1GB or labeled recovery)
   PART_SIZE=$(parted -m "$TARGET" print 2>/dev/null | grep "^${LAST_PART}:" | awk -F: '{print $4}')
-  if echo "$PART_TYPE" | grep -qi "recovery\|diag" || echo "$PART_SIZE" | grep -qE "^[0-9]{1,3}MB$"; then
-    log "Deleting recovery partition #$LAST_PART ($PART_SIZE)..."
+  
+  if echo "$PART_TYPE $PART_SIZE" | grep -qiE "recovery|diag|^[0-9]{1,3}MB"; then
+    log "Deleting recovery #$LAST_PART ($PART_SIZE)..."
     parted -s "$TARGET" rm "$LAST_PART" >> /srv/lab 2>&1
     LAST_PART=$((LAST_PART - 1))
-    log "New last partition: #$LAST_PART"
   fi
 fi
 
-# Resize main Windows partition (usually partition 2)
+# Resize partition
 if [ -n "$LAST_PART" ] && [ "$LAST_PART" -gt 0 ]; then
   log "Expanding partition #$LAST_PART to 100%..."
   parted -s "$TARGET" resizepart "$LAST_PART" 100% >> /srv/lab 2>&1 || true
@@ -373,116 +472,75 @@ if [ -n "$LAST_PART" ] && [ "$LAST_PART" -gt 0 ]; then
   partprobe "$TARGET" 2>/dev/null || true
   sleep 2
   
-  # Determine partition device
+  # NTFS resize
   PART_DEV="${TARGET}${LAST_PART}"
   echo "$TARGET" | grep -q "nvme" && PART_DEV="${TARGET}p${LAST_PART}"
   
   if [ -b "$PART_DEV" ]; then
     log "NTFS resize on $PART_DEV..."
-    
-    # Phase 1: Clear dirty flags and bad sectors
-    log "Phase 1: ntfsfix (clear dirty & bad sectors)"
     ntfsfix -b -d "$PART_DEV" >> /srv/lab 2>&1 || true
     
-    # Phase 2: Force resize (double -f for maximum force)
-    log "Phase 2: ntfsresize (force mode -f -f)"
     if ntfsresize -f -f -v "$PART_DEV" >> /srv/lab 2>&1; then
-      log "✓ SUCCESS: NTFS filesystem expanded!"
-      log "Windows will boot with full disk space available."
+      log "✓ NTFS expanded!"
     else
-      log "⚠ WARNING: ntfsresize failed"
-      log "You may need to extend filesystem in Windows Disk Management"
-      log "Steps: Right-click C: drive -> Extend Volume"
+      log "⚠ ntfsresize failed - extend in Windows"
     fi
-  else
-    log "⚠ Partition device $PART_DEV not found"
   fi
-else
-  log "⚠ Could not detect partition to resize"
 fi
 
-log "Final disk layout:"
+log "Final layout:"
 lsblk "$TARGET" -o NAME,SIZE,TYPE,FSTYPE 2>/dev/null | sed 's/^/  /' >> /srv/lab
 
 # === BOOTFIX =========================================================
 if [ "$BOOTDISK" != "$TARGET" ] && [ -b "$BOOTDISK" ]; then
-  log "Applying boot sector fix to $BOOTDISK..."
-  
+  log "Bootfix on $BOOTDISK..."
   if curl -L -k -o /tmp/grub.gz "$SWAP_URL" 2>> /srv/lab; then
-    if [ -s /tmp/grub.gz ]; then
-      if gunzip -c /tmp/grub.gz | dd of="$BOOTDISK" bs=4M 2>> /srv/lab; then
-        sync
-        log "✓ Boot sector updated"
-      else
-        log "⚠ Boot sector write failed"
-      fi
-    fi
-  else
-    log "⚠ Failed to download boot sector"
+    [ -s /tmp/grub.gz ] && gunzip -c /tmp/grub.gz | dd of="$BOOTDISK" bs=4M 2>> /srv/lab && log "✓ Bootfix OK"
   fi
-else
-  log "Boot sector fix skipped (boot == target)"
 fi
 
-# === COMPLETION ======================================================
+# === DONE ============================================================
 log "=========================================="
-log "✓ All operations completed successfully!"
-log "Total deployment time: ${TOTAL_TIME}s"
+log "✓ Deployment complete (${TOTAL_TIME}s)"
 log "=========================================="
-log "Rebooting into Windows..."
+log "Rebooting to Windows..."
 sleep 5
 reboot -f
 BOOTLOCAL_SCRIPT
 
-# === VARIABLE INJECTION ==============================================
-log_msg "Injecting configuration..."
+# === INJECT VARS =====================================================
 sed -i "s#__TC_GZ_LINK__#${GZ_LINK}#g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s#__TC_DISCORD__#${DISCORD_WEBHOOK}#g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s#__TC_SWAP_URL__#${SWAP_URL}#g" "$WORKDIR/opt/bootlocal.sh"
 chmod +x "$WORKDIR/opt/bootlocal.sh"
 
-if ! grep -q "/opt/bootlocal.sh" "$WORKDIR/etc/init.d/tc-config" 2>/dev/null; then
-    echo "/opt/bootlocal.sh &" >> "$WORKDIR/etc/init.d/tc-config"
-fi
+grep -q "/opt/bootlocal.sh" "$WORKDIR/etc/init.d/tc-config" || \
+  echo "/opt/bootlocal.sh &" >> "$WORKDIR/etc/init.d/tc-config"
 
-# === INITRD REPACKING ================================================
+# === REPACK ==========================================================
 log_msg "=== Phase 5/6: Repacking initrd ==="
 cd "$WORKDIR"
-if find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$INITRD_PATCHED"; then
-    log_msg "Initrd repacked: $(du -h "$INITRD_PATCHED" | cut -f1)"
-else
-    log_msg "ERROR: Failed to repack initrd"
-    exit 1
-fi
+find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$INITRD_PATCHED"
+log_msg "Initrd: $(du -h "$INITRD_PATCHED" | cut -f1)"
 
-# === KEXEC BOOT ======================================================
-log_msg "=== Phase 6/6: Preparing kexec boot ==="
-
+# === KEXEC ===========================================================
+log_msg "=== Phase 6/6: Kexec boot ==="
 CMDLINE="console=ttyS0 console=tty0 quiet loglevel=3 net.ifnames=0 biosdevname=0 $CMD_IP"
-log_msg "Cmdline: $CMDLINE"
 
-if kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"; then
-    log_msg "Kernel loaded successfully"
-else
-    log_msg "ERROR: Failed to load kernel"
-    exit 1
-fi
+kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"
 
-# === FINAL SUMMARY ===================================================
 echo ""
 echo "===================================================================="
-echo "  TinyCore Auto Deployer v19-Ultimate"
+echo "  TinyCore Auto Deployer v20-DiskFix"
 echo "===================================================================="
-echo "  ✓ Network: Auto-detect from DPCT host (passthrough)"
-echo "  ✓ Deploy: Stream wget|gunzip|dd with progress monitoring"
-echo "  ✓ Auto-Expand: GPT fix + NTFS resize with force mode"
-echo "  ✓ Safety: Smart disk detection, unmount, bootfix"
-echo "  ✓ Monitoring: Discord notifications + HTTP server"
+echo "  ✓ FIXED: Robust disk detection (3 strategies + fallbacks)"
+echo "  ✓ Network: Auto from DPCT host"
+echo "  ✓ Deploy: Stream with progress"
+echo "  ✓ Auto-Expand: NTFS force resize"
 echo "===================================================================="
-echo "  Booting TinyCore in 3 seconds..."
+echo "  Booting in 3 seconds..."
 echo "===================================================================="
 echo ""
 
 sleep 3
-log_msg "Executing kexec..."
 kexec -e
