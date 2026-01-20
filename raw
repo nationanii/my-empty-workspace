@@ -11,8 +11,8 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://is.gd/FsLFUt"   # file .img.gz (có redirect OK)
-DISCORD_WEBHOOK="https://discord.com/api/webhooks/1429279907019751455/Azhau1RLr38g8rCrZh6XLhLKBCY_I54wO2bHCj2CrWurfa8DIjTA98WJKaL96bIZZ7HD"
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # file .img.gz (có redirect OK)
+DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlvc-0CWC7VpM30bKr1ulMPUrCFZAUr7r06VPqFkbgCvCRbuyde_Ffc-0joff"
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
 # === TINYCORE BOOT ARTIFACTS =========================================
@@ -118,15 +118,61 @@ else
   log "[NET] IPv4 acquired on $FOUND_NIC"
   ip -4 addr show dev "$FOUND_NIC" | sed 's/^/[IP] /' >> /srv/lab
 fi
+# --- DISK DETECT (SMART) ---
+log "[DISK] Detecting target (Smart Mode)..."
 
-# Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
-log "[DISK] Detecting target..."
+# 1. Hàm kiểm tra đĩa có hợp lệ không (Phải là Disk, Read-Write, Size > 10GB)
+# TinyCore lsblk output: NAME TYPE RO SIZE(bytes)
+# 10GB = 10737418240 bytes
+get_valid_disks() {
+  lsblk -dn -o NAME,TYPE,RO,SIZE -b | \
+  awk '$2=="disk" && $3==0 && $4>=10737418240 {print "/dev/"$1}'
+}
+
+VALID_DISKS=$(get_valid_disks)
+log "[DISK] Candidates (>10GB, RW): $(echo $VALID_DISKS | tr '\n' ' ')"
+
 TARGET=""
-for d in /dev/sdb /dev/vdb /dev/nvme1n1 /dev/sda; do [ -b "$d" ] && TARGET="$d" && break; done
-[ -z "$TARGET" ] && TARGET="$(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | head -n1 | awk '{print "/dev/"$1}')"
-[ -z "$TARGET" ] && { log "[ERR] No disk. Rebooting in 3s..."; sleep 3; reboot -f; }
-log "[DISK] Using: $TARGET"
+
+# 2. Logic ưu tiên: Tìm trong danh sách hợp lệ theo thứ tự bạn muốn
+# Ưu tiên sdb/vdb để né ổ boot (sda) nếu có 2 ổ
+PRIORITY_LIST="/dev/sdb /dev/vdb /dev/nvme1n1 /dev/nvme0n1 /dev/sda /dev/vda /dev/xvda"
+
+for p in $PRIORITY_LIST; do
+  if echo "$VALID_DISKS" | grep -q "$p"; then
+    TARGET="$p"
+    log "[DISK] Match priority: $TARGET"
+    break
+  fi
+done
+
+# 3. Fallback: Nếu không khớp priority, chọn ổ ĐĨA LỚN NHẤT tìm thấy
+if [ -z "$TARGET" ]; then
+  # Lấy dòng đầu tiên của danh sách valid (thường lsblk sắp xếp, hoặc lấy bất kỳ cái nào hợp lệ)
+  TARGET=$(echo "$VALID_DISKS" | head -n1)
+  [ -n "$TARGET" ] && log "[DISK] Fallback to available disk: $TARGET"
+fi
+
+# 4. Kiểm tra sinh tử lần cuối
+if [ -z "$TARGET" ] || [ ! -b "$TARGET" ]; then
+  log "[ERR] FATAL: No valid target disk found (>10GB, RW). List:"
+  lsblk -o NAME,SIZE,TYPE,RO >> /srv/lab
+  log "[ERR] Rebooting in 10s..."
+  sleep 10; reboot -f
+fi
+
+# 5. Thông báo chốt đơn
+log "[DISK] >>> FINAL TARGET: $TARGET <<<"
 lsblk "$TARGET" -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | sed 's/^/[LSBLK] /' >> /srv/lab
+
+# 6. Safety Check: Nếu Target đang được mount (ví dụ /mnt/sda1), phải unmount cực mạnh
+for m in $(mount | grep "$TARGET" | awk '{print $3}'); do
+  log "[DISK] Unmounting active partition: $m"
+  umount -f "$m" 2>/dev/null || true
+done
+swapoff -a 2>/dev/null || true
+sync
+sleep 2
 
 # Unmount mọi phân vùng của TARGET
 for m in $(mount | awk -v t="$TARGET" '$1 ~ t{print $3}'); do
@@ -134,10 +180,36 @@ for m in $(mount | awk -v t="$TARGET" '$1 ~ t{print $3}'); do
 done
 sync; sleep 3
 
-# Xác định boot-disk (đĩa hiện chứa /boot hoặc root)
-BOOTDISK="$(lsblk -no PKNAME "$(readlink -f /dev/root 2>/dev/null || echo /dev/sda)" 2>/dev/null | sed 's#^#/dev/#')"
-[ -z "$BOOTDISK" ] && BOOTDISK="/dev/sda"
-log "[DISK] Boot-disk guessed: $BOOTDISK"
+# --- DETECT BOOT DISK (System Drive) ---
+# Trong môi trường RAM (TinyCore), ta không thể check /dev/root.
+# Giả định chuẩn: Đĩa vật lý đầu tiên (sda, vda, nvme0n1) là đĩa được BIOS boot.
+
+log "[DISK] Identifying Boot-Disk (MBR Target)..."
+
+# 1. Liệt kê tất cả Physical Disks (loại bỏ loop, sr0, ram), sắp xếp theo tên
+# Kết quả sẽ dạng: /dev/nvme0n1 hoặc /dev/sda
+ALL_PHYSICAL_DISKS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | sort)
+
+# 2. Lấy đĩa đầu tiên trong danh sách (Disk 0)
+DETECTED_BOOTDISK=$(echo "$ALL_PHYSICAL_DISKS" | head -n1)
+
+# 3. Kiểm tra và gán
+if [ -b "$DETECTED_BOOTDISK" ]; then
+  BOOTDISK="$DETECTED_BOOTDISK"
+  log "[DISK] Boot-disk found (Disk 0): $BOOTDISK"
+else
+  # Fallback: Nếu không tìm thấy gì, đoán mò là sda (cho hệ thống cũ)
+  BOOTDISK="/dev/sda"
+  log "[WARN] Could not detect Boot-disk. Fallback to: $BOOTDISK"
+fi
+
+# 4. Debug info: So sánh Target và Bootdisk
+if [ "$TARGET" != "$BOOTDISK" ]; then
+  log "[INFO] Cross-flash detected: Target is $TARGET but System Boots from $BOOTDISK."
+  log "[INFO] Bootfix (Chainloader) will be required on $BOOTDISK."
+else
+  log "[INFO] Standard Flash: Target is the same as Boot-disk."
+fi
 
 # Debug redirect chain (không fail nếu lỗi)
 log "[IMG] Checking redirect chain (wget --spider -S)..."
@@ -150,7 +222,7 @@ log "[IMG] PIPE: wget -S -O- \"$IMAGE_URL\" | gunzip -c | dd of=\"$TARGET\" bs=4
 (
   wget --no-check-certificate -S -O- "$IMAGE_URL" 2>>/srv/lab \
   | gunzip -c \
-  | dd of="$TARGET" bs=4M conv=fsync 2>>/srv/lab
+  | dd of="$TARGET" bs=64M conv=fsync 2>>/srv/lab
 ) &
 PIPE_PID=$!
 
