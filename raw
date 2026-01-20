@@ -11,8 +11,8 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # file .img.gz (có redirect OK)
-DISCORD_WEBHOOK="https://discord.com/api/webhooks/1460967132761423913/8cPQaQCrlvc-0CWC7VpM30bKr1ulMPUrCFZAUr7r06VPqFkbgCvCRbuyde_Ffc-0joff"
+GZ_LINK="https://is.gd/FsLFUt"   # file .img.gz (có redirect OK)
+DISCORD_WEBHOOK="https://discord.com/api/webhooks/1429279907019751455/Azhau1RLr38g8rCrZh6XLhLKBCY_I54wO2bHCj2CrWurfa8DIjTA98WJKaL96bIZZ7HD"
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"  # bootfix (MBR/bootsector)
 
 # === TINYCORE BOOT ARTIFACTS =========================================
@@ -31,17 +31,6 @@ BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybo
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 echo 'kexec-tools kexec-tools/load_kexec boolean true' | debconf-set-selections
-
-
-# [INSERT AT START] Detect Physical Boot Disk from Host OS
-echo "[0/6] Detecting Host Boot Disk..."
-# Tìm thiết bị đang mount vào / (ví dụ /dev/sda1)
-HOST_ROOT_PART=$(findmnt / -o SOURCE -n)
-# Tìm disk cha của partition đó (ví dụ sda)
-HOST_BOOT_NAME=$(lsblk -no PKNAME "$HOST_ROOT_PART" | head -n1)
-# Nếu không tìm thấy, mặc định sda
-[ -z "$HOST_BOOT_NAME" ] && HOST_BOOT_NAME="sda"
-echo "Detected Host Boot Disk: /dev/$HOST_BOOT_NAME"
 
 echo "[1/6] Installing deps..."
 apt-get -y -qq update
@@ -130,43 +119,14 @@ else
   ip -4 addr show dev "$FOUND_NIC" | sed 's/^/[IP] /' >> /srv/lab
 fi
 
-# Disk detect: Chọn ổ đĩa LỚN NHẤT có thể ghi (Writable)
+# Disk detect — ƯU TIÊN /dev/sdb để tránh ghi lên disk đang boot
 log "[DISK] Detecting target..."
-
-# 1. Liệt kê các thiết bị block
-# -d: device (không lấy partition)
-# -n: no header
-# -b: size in bytes (để sort chính xác)
-# -o: output columns (NAME, TYPE, RO=Readonly, RM=Removable, SIZE)
-# awk lọc: chỉ lấy type=disk, RO=0 (ghi được)
-# sort: sắp xếp theo cột dung lượng (cột 2 sau khi awk xử lý) giảm dần (-nr)
-# head: lấy dòng đầu tiên (ổ to nhất)
-
-TARGET_NAME=$(lsblk -dnb -o NAME,TYPE,RO,RM,SIZE | \
-              awk '$2=="disk" && $3=="0" {print $1, $5}' | \
-              sort -k2 -nr | \
-              head -n1 | \
-              awk '{print $1}')
-
-if [ -n "$TARGET_NAME" ]; then
-    TARGET="/dev/$TARGET_NAME"
-else
-    TARGET=""
-fi
-
-# Fallback an toàn nếu lệnh trên lỗi (hiếm khi xảy ra trên TinyCore nếu có util-linux)
-if [ -z "$TARGET" ]; then
-    log "[WARN] Smart detect failed, falling back to legacy list..."
-    for d in /dev/vda /dev/sda /dev/nvme0n1 /dev/sdb /dev/xvda; do 
-        if [ -b "$d" ]; then TARGET="$d"; break; fi
-    done
-fi
-
-[ -z "$TARGET" ] && { log "[ERR] No valid disk found. Rebooting..."; sleep 5; reboot -f; }
-
-log "[DISK] Selected Target: $TARGET"
-# Log thông tin chi tiết để debug
-lsblk -o NAME,SIZE,TYPE,FSTYPE,MODEL "$TARGET" 2>/dev/null | sed 's/^/[LSBLK-CHECK] /' >> /srv/lab
+TARGET=""
+for d in /dev/sdb /dev/vdb /dev/nvme1n1 /dev/sda; do [ -b "$d" ] && TARGET="$d" && break; done
+[ -z "$TARGET" ] && TARGET="$(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | head -n1 | awk '{print "/dev/"$1}')"
+[ -z "$TARGET" ] && { log "[ERR] No disk. Rebooting in 3s..."; sleep 3; reboot -f; }
+log "[DISK] Using: $TARGET"
+lsblk "$TARGET" -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null | sed 's/^/[LSBLK] /' >> /srv/lab
 
 # Unmount mọi phân vùng của TARGET
 for m in $(mount | awk -v t="$TARGET" '$1 ~ t{print $3}'); do
@@ -174,11 +134,10 @@ for m in $(mount | awk -v t="$TARGET" '$1 ~ t{print $3}'); do
 done
 sync; sleep 3
 
-log "[DISK] Identifying Boot Disk..."
-
-# Lấy từ Kernel Cmdline
-BOOTDISK=$(cat /proc/cmdline | tr ' ' '\n' | grep '^host_boot=' | cut -d= -f2)
-log "[DISK] Boot-disk determined: $BOOTDISK (Target is: $TARGET)"
+# Xác định boot-disk (đĩa hiện chứa /boot hoặc root)
+BOOTDISK="$(lsblk -no PKNAME "$(readlink -f /dev/root 2>/dev/null || echo /dev/sda)" 2>/dev/null | sed 's#^#/dev/#')"
+[ -z "$BOOTDISK" ] && BOOTDISK="/dev/sda"
+log "[DISK] Boot-disk guessed: $BOOTDISK"
 
 # Debug redirect chain (không fail nếu lỗi)
 log "[IMG] Checking redirect chain (wget --spider -S)..."
@@ -256,7 +215,7 @@ echo "[5/6] Repack initrd..."
 find . | cpio -o -H newc | gzip -c > "$INITRD_PATCHED"
 
 echo "[6/6] Kexec TinyCore..."
-CMDLINE="console=ttyS0 quiet host_boot=/dev/${HOST_BOOT_NAME}"
+CMDLINE="console=ttyS0 quiet"
 kexec -l "$KERNEL_PATH" --initrd="$INITRD_PATCHED" --command-line="$CMDLINE"
 echo "===================================================="
 echo "🚀 TinyCore v7-netfix-stable-bootfix: safe target + real DHCP + wget|gunzip|dd + bootfix"
