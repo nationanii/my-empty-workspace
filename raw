@@ -221,29 +221,43 @@ echo "[TTYD] Starting web terminal on :$GOTTY_PORT..."
 echo "[TTYD] Local:  http://$HOST_IP:$GOTTY_PORT/"
 echo "[TTYD] Public: http://$PUBLIC_IP:$GOTTY_PORT/"
 
-# Start ttyd (simpler, more reliable than GoTTY)
+# Tạo wrapper script để ttyd luôn có process chạy
+cat > /tmp/ttyd_wrapper.sh <<'WRAPPER'
+#!/bin/sh
+while true; do
+    if [ -f /tmp/deploy.log ]; then
+        tail -f /tmp/deploy.log
+    else
+        echo "Waiting for deployment to start..."
+        sleep 1
+    fi
+done
+WRAPPER
+chmod +x /tmp/ttyd_wrapper.sh
+
+# Start ttyd với wrapper (không bao giờ exit)
 /srv/ttyd -p "$GOTTY_PORT" \
     -i 0.0.0.0 \
     -t fontSize=14 \
-    -t theme='{"background":"#1e1e1e","foreground":"#d4d4d4"}' \
-    -t titleFixed="TinyCore Deployer" \
-    sh -c "tail -f /tmp/deploy.log" >> /tmp/ttyd.log 2>&1 &
+    -t disableReconnect=false \
+    -t 'theme={"background":"#1e1e1e","foreground":"#d4d4d4"}' \
+    /tmp/ttyd_wrapper.sh &
 
 TTYD_PID=$!
-sleep 2
+sleep 3
 
-# Verify ttyd is running
 if kill -0 "$TTYD_PID" 2>/dev/null; then
-    echo "[TTYD] ✓ Web terminal started (PID: $TTYD_PID)"
+    echo "[TTYD] ✓ Web terminal running (PID: $TTYD_PID)"
+    echo "[TTYD] ✓ Access at http://$PUBLIC_IP:$GOTTY_PORT/"
 else
-    echo "[TTYD] ✗ Failed to start! Check log:"
-    cat /tmp/ttyd.log 2>/dev/null || echo "No log"
+    echo "[TTYD] ✗ Failed to start!"
 fi
 
 # === MINIMAL PACKAGES (CHỈ CẦN THIẾT) ===============================
 echo ""
 echo "[PKG] Loading essential packages..."
-for pkg in ca-certificates openssl curl net-tools; do
+# util-linux chứa lsblk
+for pkg in ca-certificates openssl curl util-linux; do
     su tc -c "tce-load -wi $pkg" >/dev/null 2>&1 || echo "[PKG] Warning: $pkg failed"
 done
 
@@ -251,9 +265,9 @@ done
 echo ""
 echo "[DISK] Preparing $TARGET_DISK..."
 
-# Unmount all partitions
-for part in $(lsblk -lno NAME "$TARGET_DISK" | tail -n+2); do
-    umount -f "/dev/$part" 2>/dev/null || true
+# Unmount all partitions (dùng mount thay vì lsblk)
+mount | grep "^$TARGET_DISK" | awk '{print $1}' | while read part; do
+    umount -f "$part" 2>/dev/null || true
 done
 
 # Quick wipe MBR/GPT (không cần wipe toàn bộ)
@@ -270,28 +284,66 @@ echo "[IMG] Started: $(date)"
 
 START_TIME=$(date +%s)
 
-# Stream: wget -> gunzip -> dd (bs=8M cho tốc độ tốt hơn)
-wget --no-check-certificate -O- "$IMAGE_URL" 2>/tmp/wget.log | \
-    gunzip -c | \
-    dd of="$TARGET_DISK" bs=8M conv=fsync status=progress 2>&1 | \
-    while read line; do
-        echo "[DD] $line"
-    done
+# Debug: check wget capability
+echo "[IMG] Testing connection..."
+if ! wget --spider --no-check-certificate "$IMAGE_URL" 2>&1 | grep -q "200 OK\|302 Found\|301 Moved"; then
+    echo "[WARN] wget spider test failed, proceeding anyway..."
+fi
 
+# Stream: wget -> gunzip -> dd (bs=8M cho tốc độ tốt hơn)
+echo "[IMG] Starting stream: wget | gunzip | dd"
+(
+    wget --no-check-certificate --timeout=30 --tries=3 -O- "$IMAGE_URL" 2>&1 | \
+        tee /tmp/wget.log | \
+        gunzip -c 2>&1 | \
+        tee /tmp/gunzip.log | \
+        dd of="$TARGET_DISK" bs=8M conv=fsync oflag=direct 2>&1
+) &
+
+PIPE_PID=$!
+echo "[IMG] Pipeline PID: $PIPE_PID"
+
+# Monitor progress
+COUNTER=0
+while kill -0 "$PIPE_PID" 2>/dev/null; do
+    # Check dd progress
+    if [ -e "/proc/$PIPE_PID" ]; then
+        WRITTEN=$(cat "/sys/block/$(basename $TARGET_DISK)/stat" 2>/dev/null | awk '{print $7*512/1024/1024}' || echo "?")
+        echo "[IMG] Running... ${COUNTER}s (Written: ${WRITTEN}MB)"
+    fi
+    sleep 5
+    COUNTER=$((COUNTER + 5))
+    
+    # Timeout after 30 minutes
+    if [ "$COUNTER" -gt 1800 ]; then
+        echo "[ERR] Timeout after 30 minutes!"
+        kill -9 "$PIPE_PID" 2>/dev/null || true
+        break
+    fi
+done
+
+# Wait for completion
+wait "$PIPE_PID"
 RC=$?
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
+echo "[IMG] Pipeline exited with code: $RC"
+echo "[IMG] Duration: ${DURATION}s"
+
+# Check logs for errors
 if [ "$RC" -ne 0 ]; then
     echo "[ERR] Deployment failed! Exit code: $RC"
-    echo "[ERR] Last wget errors:"
-    tail -20 /tmp/wget.log
-    sleep 30
+    echo "[ERR] === WGET LOG ==="
+    tail -50 /tmp/wget.log 2>/dev/null || echo "No wget log"
+    echo "[ERR] === GUNZIP LOG ==="
+    tail -50 /tmp/gunzip.log 2>/dev/null || echo "No gunzip log"
+    echo "[ERR] Sleeping 60s for debugging..."
+    sleep 60
     reboot -f
 fi
 
-echo "[IMG] ✓ Completed in ${DURATION}s"
-
+echo "[IMG] ✓ Stream completed"
 sync
 partprobe "$TARGET_DISK" 2>/dev/null || true
 
@@ -318,12 +370,24 @@ echo "✅ DEPLOYMENT COMPLETE"
 echo "=========================================="
 echo "Duration: ${DURATION}s"
 echo "Target: $TARGET_DISK"
-lsblk "$TARGET_DISK" -o NAME,SIZE,TYPE
-echo ""
-echo "Rebooting in 10 seconds..."
-echo "GoTTY will remain accessible until reboot"
 
-sleep 10
+# Hiển thị thông tin disk (không dùng lsblk)
+echo ""
+echo "Disk info:"
+/srv/busybox fdisk -l "$TARGET_DISK" 2>/dev/null | grep -E "^Disk |^Device" || echo "Unable to show disk info"
+
+echo ""
+echo "🌐 Web terminal will close in 30 seconds"
+echo "   You can still access logs until then"
+echo ""
+
+# Keep ttyd running for 30s để user kịp xem
+for i in 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
+    echo "Rebooting in ${i}s..."
+    sleep 1
+done
+
+echo "Rebooting NOW..."
 reboot -f
 EOFS
 
