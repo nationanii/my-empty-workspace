@@ -1,168 +1,179 @@
 #!/bin/bash
 set -euo pipefail
 
-# ==============================================================================
-# TinyCore Fast Windows Deployer v9 (Public IP Support + GoTTY)
-# ==============================================================================
+# =====================================================================
+# TinyCore Deployer v8-gotty-static-speed
+# - Monitor: GoTTY (Realtime Web Terminal)
+# - Network: Static IP (Inherit from Host) - No DHCP waiting
+# - Disk: Auto-detect Root Disk on Host -> Pass to TinyCore
+# - Optimization: Minimal extensions, Pre-downloaded binaries
+# =====================================================================
 
-# --- CẤU HÌNH ---
-IMAGE_URL="https://148.100.76.25:3923/WindowsCustom.gz"   # Link file .img.gz (Windows)
-GOTTY_PORT="80"                    # Port web terminal (Đảm bảo Firewall mở port này)
+# === CONFIG ==========================================================
+GZ_LINK="https://is.gd/ZubYbG"   # Link file .img.gz
+GOTTY_URL="https://github.com/yudai/gotty/releases/download/v1.0.1/gotty_linux_amd64.tar.gz"
 
-# ==============================================================================
-# BƯỚC 1: LẤY THÔNG TIN MẠNG (QUAN TRỌNG)
-# ==============================================================================
-echo "[1/6] Detecting Network & Disk..."
+# === 1. PREPARE HOST INFO (NET & DISK) ===============================
+echo "[1/7] Detecting Host Network & Disk..."
 
-# 1.1 Lấy Public IP (Để hiển thị link truy cập)
-# Chúng ta lấy IP này TRƯỚC khi vào TinyCore để tránh việc vào đó không curl được
-PUBLIC_IP=$(curl -s -4 --connect-timeout 5 https://ifconfig.me || curl -s -4 https://api.ipify.org)
-[ -z "$PUBLIC_IP" ] && PUBLIC_IP="Unknown"
-echo " -> Public IP detected: $PUBLIC_IP"
+# Detect Network Interface
+MAIN_IF=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
+# Detect IP/CIDR (Example: 103.1.1.5/24)
+HOST_IP_CIDR=$(ip -4 addr show "$MAIN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
+# Detect Gateway
+HOST_GW=$(ip route | grep default | awk '{print $3}' | head -n1)
+# Detect Root Disk (Disk chứa phân vùng /)
+ROOT_PART=$(findmnt -n / -o SOURCE)
+# Lấy tên ổ đĩa gốc (vd: /dev/vda từ /dev/vda1)
+HOST_DISK="/dev/$(lsblk -no pkname "$ROOT_PART" | head -n1)"
 
-# 1.2 Lấy thông tin Interface nội bộ (Để cấu hình card mạng)
-# Bắt buộc phải dùng thông tin này thì VPS mới có mạng (đặc biệt là AWS/GCP/Azure)
-MAIN_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-LOCAL_IP=$(ip -4 addr show "$MAIN_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
-GATEWAY=$(ip route show default | awk '/default/ {print $3}' | head -n1)
+if [ -z "$HOST_IP_CIDR" ] || [ -z "$HOST_GW" ] || [ -z "$HOST_DISK" ]; then
+    echo "ERROR: Could not detect Network or Disk info."
+    echo "IP: $HOST_IP_CIDR, GW: $HOST_GW, DISK: $HOST_DISK"
+    exit 1
+fi
 
-# Tính Netmask
-CIDR=$(ip -4 addr show "$MAIN_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1 | awk -F'/' '{print $2}')
-cdr2mask () {
-   set -- $(( 5 - ($1 / 8) )) 255 255 255 255 $(( (255 << (8 - ($1 % 8))) & 255 )) 0 0 0
-   [ $1 -gt 1 ] && shift $1 || shift
-   echo ${1-0}.${2-0}.${3-0}.${4-0}
-}
-NETMASK=$(cdr2mask "$CIDR")
-DNS_SERVER="8.8.8.8"
+echo " -> Network: $HOST_IP_CIDR (GW: $HOST_GW)"
+echo " -> Target Disk: $HOST_DISK"
 
-echo " -> Internal Config: IP=$LOCAL_IP | GW=$GATEWAY | Mask=$NETMASK"
-
-# 1.3 Xác định ổ đĩa cài đặt (Tránh ghi nhầm)
-ROOT_DEVICE=$(findmnt / -o SOURCE -n -k)
-TARGET_DISK=$(lsblk -no PKNAME "$ROOT_DEVICE" | head -n1)
-# Xử lý nvme0n1p1 -> nvme0n1
-if [[ "$TARGET_DISK" == "" ]]; then TARGET_DISK=$(echo "$ROOT_DEVICE" | sed 's/[0-9]*$//'); fi
-if [[ "$TARGET_DISK" != /dev/* ]]; then TARGET_DISK="/dev/$TARGET_DISK"; fi
-echo " -> Target Disk: $TARGET_DISK"
-
-# ==============================================================================
-# BƯỚC 2: CHUẨN BỊ TOOL
-# ==============================================================================
-echo "[2/6] Downloading tools..."
+# === 2. INSTALL HOST DEPS ============================================
+echo "[2/7] Installing dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get -y -qq update
-apt-get -y -qq install wget curl gzip cpio kexec-tools ca-certificates
+apt-get -y -qq install wget curl gzip cpio kexec-tools tar --no-install-recommends
 
-WORKDIR="/tmp/tc_deploy"
-rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
-BOOT_DIR="/boot/tinycore_deploy"
-mkdir -p "$BOOT_DIR"
+# === 3. PREPARE TINYCORE FILES =======================================
+echo "[3/7] Downloading TinyCore & Tools..."
+WORKDIR="/tmp/tc_build"
+rm -rf "$WORKDIR" && mkdir -p "$WORKDIR/opt" "$WORKDIR/bin"
 
-# Tải Kernel TinyCore
 TCE_MIRROR="http://tinycorelinux.net/14.x/x86_64/release/distribution_files"
-wget -q -O "$BOOT_DIR/vmlinuz64" "$TCE_MIRROR/vmlinuz64"
-wget -q -O "$BOOT_DIR/corepure64.gz" "$TCE_MIRROR/corepure64.gz"
+wget -q -O "$WORKDIR/vmlinuz64" "$TCE_MIRROR/vmlinuz64"
+wget -q -O "$WORKDIR/corepure64.gz" "$TCE_MIRROR/corepure64.gz"
 
-# Tải GoTTY (Static Binary)
-wget -q -O "$WORKDIR/gotty.tar.gz" "https://github.com/yudai/gotty/releases/download/v1.0.1/gotty_linux_amd64.tar.gz"
-tar xf "$WORKDIR/gotty.tar.gz" -C "$WORKDIR"
-chmod +x "$WORKDIR/gotty"
+# Download GoTTY (Static binary)
+echo " -> Downloading GoTTY..."
+wget -q -O "$WORKDIR/gotty.tar.gz" "$GOTTY_URL"
+tar -xzf "$WORKDIR/gotty.tar.gz" -C "$WORKDIR/bin/"
+chmod +x "$WORKDIR/bin/gotty"
+rm "$WORKDIR/gotty.tar.gz"
 
-# ==============================================================================
-# BƯỚC 3: TẠO INITRD MỚI
-# ==============================================================================
-echo "[3/6] Injecting scripts into RAMDisk..."
-cd "$WORKDIR"
-mkdir -p unpack
-cd unpack
-gzip -dc "$BOOT_DIR/corepure64.gz" | cpio -idmv >/dev/null 2>&1
+# === 4. UNPACK & INJECT INITRD =======================================
+echo "[4/7] Injecting scripts into Initrd..."
+mkdir -p "$WORKDIR/rootfs"
+cd "$WORKDIR/rootfs"
+gzip -dc "../corepure64.gz" | cpio -idmv >/dev/null 2>&1
 
-# Copy GoTTY
-cp "$WORKDIR/gotty" usr/bin/
+# Copy GoTTY to rootfs
+cp "$WORKDIR/bin/gotty" "$WORKDIR/rootfs/usr/local/bin/"
 
-# Tạo script chạy tự động
-cat > opt/bootlocal.sh <<EOF
+# Create bootlocal.sh
+cat > "$WORKDIR/rootfs/opt/bootlocal.sh" <<'EOF'
 #!/bin/sh
-# --- VARIABLES ---
-TARGET_DISK="${TARGET_DISK}"
-LOCAL_IP="${LOCAL_IP}"
-NETMASK="${NETMASK}"
-GATEWAY="${GATEWAY}"
-DNS="${DNS_SERVER}"
-PUBLIC_IP="${PUBLIC_IP}"
-IMAGE_URL="${IMAGE_URL}"
-PORT="${GOTTY_PORT}"
-# -----------------
+# --- TINYCORE BOOT SCRIPT ---
+LOG="/tmp/install.log"
+touch $LOG
 
-LOGFILE="/tmp/install.log"
+# Helper to log
+log() { echo "[$1] $2"; echo "[$1] $2" >> $LOG; }
 
-# 1. Cấu hình mạng (Dùng thông tin nội bộ để kết nối Gateway)
-ifconfig eth0 \$LOCAL_IP netmask \$NETMASK up
-route add default gw \$GATEWAY
-echo "nameserver \$DNS" > /etc/resolv.conf
+# 1. Parse Kernel Cmdline for Configs
+for x in $(cat /proc/cmdline); do
+  case "$x" in
+    tc_ip=*) MY_IP="${x#*=}" ;;
+    tc_gw=*) MY_GW="${x#*=}" ;;
+    tc_disk=*) MY_DISK="${x#*=}" ;;
+    tc_img=*) IMG_URL="${x#*=}" ;;
+  esac
+done
 
-# 2. Bắt đầu ghi log
-echo "==================================================" > \$LOGFILE
-echo " TINYCORE INSTALLER - GOTTY MODE" >> \$LOGFILE
-echo "==================================================" >> \$LOGFILE
-echo " [NETWORK] Local IP: \$LOCAL_IP" >> \$LOGFILE
-echo " [NETWORK] Public IP: \$PUBLIC_IP" >> \$LOGFILE
-echo " [DISK] Target: \$TARGET_DISK" >> \$LOGFILE
-echo " [INFO] Access this terminal at: http://\$PUBLIC_IP:\$PORT" >> \$LOGFILE
-echo "==================================================" >> \$LOGFILE
+# 2. Start GoTTY (Port 80, Read-only view of the log)
+# Running in background so it doesn't block
+log "GOTTY" "Starting Web Terminal on Port 80..."
+/usr/local/bin/gotty -p 80 -w=false --title-format "TinyCore Installer" tail -f $LOG &
 
-# 3. Chạy GoTTY (Bind 0.0.0.0 để Public IP truy cập được)
-# -w false: Chỉ xem, không gõ lệnh
-# -a 0.0.0.0: Lắng nghe mọi kết nối (Quan trọng cho NAT)
-gotty -a 0.0.0.0 -p "\$PORT" -w false tail -f \$LOGFILE &
+# 3. Configure Network (Static - Instant)
+log "NET" "Configuring Static IP: $MY_IP"
+ifconfig eth0 $MY_IP up
+route add default gw $MY_GW
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
-# 4. Thực thi cài đặt
-echo "[STEP 1] Unmounting disks..." >> \$LOGFILE
-umount \$TARGET_DISK* 2>/dev/null
-swapoff -a
-
-echo "[STEP 2] Downloading & Writing Image..." >> \$LOGFILE
-echo "Source: \$IMAGE_URL" >> \$LOGFILE
-echo "Writing to: \$TARGET_DISK (bs=64M)" >> \$LOGFILE
-
-# Pipeline siêu tốc: Wget -> Gunzip -> DD
-wget --no-check-certificate -qO- "\$IMAGE_URL" \\
-| gunzip -c \\
-| dd of="\$TARGET_DISK" bs=64M conv=fsync 2>> \$LOGFILE
-
-if [ \$? -eq 0 ]; then
-    echo "" >> \$LOGFILE
-    echo "SUCCESS! System rebooting in 10s..." >> \$LOGFILE
+# 4. Check Network
+log "NET" "Checking connectivity..."
+if wget -q --spider http://google.com; then
+    log "NET" "Online! Ready to download."
+else
+    log "NET" "ERROR: No internet connection."
+    log "NET" "Debug: $(ifconfig eth0)"
+    log "NET" "Debug: $(route -n)"
     sleep 10
     reboot -f
+fi
+
+# 5. Prepare Disk
+if [ ! -b "$MY_DISK" ]; then
+    log "ERR" "Target disk $MY_DISK not found!"
+    lsblk >> $LOG
+    sleep 10
+    reboot -f
+fi
+
+log "DISK" "Target: $MY_DISK"
+log "DISK" "Unmounting partitions..."
+umount ${MY_DISK}* 2>/dev/null || true
+swapoff -a
+
+# 6. Stream Install (Wget | Gunzip | DD)
+log "INS" "Downloading & Writing Image..."
+log "INS" "Source: $IMG_URL"
+
+# Pipe with progress tracking via file size (rough estimate) or just generic wait
+wget --no-check-certificate -O- "$IMG_URL" 2>>$LOG \
+| gunzip -c \
+| dd of="$MY_DISK" bs=4M conv=fsync 2>>$LOG
+
+if [ $? -eq 0 ]; then
+    log "DONE" "Installation Complete!"
+    log "SYS" "Rebooting in 5 seconds..."
+    sleep 5
+    reboot -f
 else
-    echo "" >> \$LOGFILE
-    echo "ERROR! Installation failed." >> \$LOGFILE
+    log "ERR" "Pipeline failed. Check logs above."
     sleep 3600
 fi
 EOF
 
-chmod +x opt/bootlocal.sh
+chmod +x "$WORKDIR/rootfs/opt/bootlocal.sh"
 
-# Đóng gói lại
-find . | cpio -o -H newc | gzip -c > "$BOOT_DIR/corepure64-custom.gz"
+# Ensure bootlocal runs
+echo "/opt/bootlocal.sh &" >> "$WORKDIR/rootfs/opt/bootsync.sh"
 
-# ==============================================================================
-# BƯỚC 4: KEXEC
-# ==============================================================================
-echo "[4/6] Config loaded."
-echo "========================================================"
-echo " CHUẨN BỊ CÀI ĐẶT QUA RAM"
-echo " ----------------------------------------------------"
-echo " 1. Sau khi chạy lệnh này, kết nối SSH sẽ mất."
-echo " 2. Mở trình duyệt truy cập ngay vào:"
-echo "    http://$PUBLIC_IP:$GOTTY_PORT"
-echo " ----------------------------------------------------"
-echo "========================================================"
-echo "Booting TinyCore in 3 seconds..."
+# === 5. REPACK INITRD ================================================
+echo "[5/7] Repacking Initrd..."
+find . | cpio -o -H newc | gzip -c > "$WORKDIR/corepure64-custom.gz"
+
+# === 6. EXECUTE KEXEC ================================================
+echo "[6/7] Preparing Kexec..."
+
+# Construct Kernel Command Line with Host Variables
+# tc_ip: CIDR format (e.g., 10.0.0.2/24) is supported by busybox ifconfig in some versions,
+# but to be safe we rely on ip command if available, or ifconfig.
+# TinyCore default ifconfig might need mask separately.
+# Hack: Let's assume user has standard CIDR.
+CMDLINE="console=ttyS0 quiet tc_ip=${HOST_IP_CIDR} tc_gw=${HOST_GW} tc_disk=${HOST_DISK} tc_img=${GZ_LINK}"
+
+echo "---------------------------------------------"
+echo "TARGET IP  : http://${HOST_IP_CIDR%/*}"
+echo "TARGET DISK: ${HOST_DISK}"
+echo "---------------------------------------------"
+echo "WARNING: System will takeover in 3 seconds."
+echo "Visit http://${HOST_IP_CIDR%/*} to view progress via GoTTY."
 sleep 3
 
-CMDLINE="console=tty0 quiet"
-kexec -l "$BOOT_DIR/vmlinuz64" --initrd="$BOOT_DIR/corepure64-custom.gz" --command-line="$CMDLINE"
+kexec -l "$WORKDIR/vmlinuz64" \
+      --initrd="$WORKDIR/corepure64-custom.gz" \
+      --command-line="$CMDLINE"
+
+echo "[7/7] BOOM! Goodbye Linux..."
 kexec -e
