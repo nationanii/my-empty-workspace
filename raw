@@ -10,7 +10,7 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://is.gd/ZubYbG"   # Windows .img.gz URL
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Windows .img.gz URL
 GOTTY_PORT="8080"                 # GoTTY web terminal port
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
@@ -61,24 +61,69 @@ BOOT_DISK="$TARGET_DISK"
 echo ""
 echo "🌐 Detecting network configuration..."
 
-# Lấy interface có IPv4 public (không phải 127.0.0.1, 10.x, 172.16-31.x, 192.168.x)
-HOST_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | grep -Ev '^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^192\.168\.' | head -1)
-HOST_GW=$(ip route | grep default | awk '{print $3}' | head -1)
-HOST_NIC=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
-
-# Fallback nếu không tìm thấy IP public
-[ -z "$HOST_IP" ] && HOST_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | head -1)
+# Lấy interface đang active (có default route)
+HOST_NIC=$(ip route show default | head -1 | grep -oP 'dev \K\S+')
+[ -z "$HOST_NIC" ] && HOST_NIC=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
 [ -z "$HOST_NIC" ] && HOST_NIC="eth0"
-[ -z "$HOST_GW" ] && HOST_GW="$(echo $HOST_IP | cut -d. -f1-3).1"
 
-echo "📡 Interface: $HOST_NIC"
-echo "📍 IP: $HOST_IP"
-echo "🚪 Gateway: $HOST_GW"
+# Lấy IP local (private/public)
+HOST_IP=$(ip -4 addr show dev "$HOST_NIC" | grep -oP 'inet \K[\d.]+' | head -1)
+
+# Nếu không có IP trên NIC đó, lấy bất kỳ IP nào (trừ 127.0.0.1)
+if [ -z "$HOST_IP" ]; then
+    HOST_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | head -1)
+fi
+
+# Lấy gateway
+HOST_GW=$(ip route show default | head -1 | awk '{print $3}')
+if [ -z "$HOST_GW" ]; then
+    # Fallback: tính gateway từ IP (thay byte cuối = 1)
+    HOST_GW="$(echo $HOST_IP | cut -d. -f1-3).1"
+fi
+
+# Lấy netmask/prefix (ví dụ: 24 từ 10.0.1.179/24)
+HOST_CIDR=$(ip -4 addr show dev "$HOST_NIC" | grep -oP 'inet [\d.]+/\K\d+' | head -1)
+[ -z "$HOST_CIDR" ] && HOST_CIDR="24"
 
 # Lấy nameserver
 HOST_DNS=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
 [ -z "$HOST_DNS" ] && HOST_DNS="1.1.1.1"
+
+# === DETECT PUBLIC IP (cho GoTTY access) =============================
+echo "🔍 Detecting public IPv4..."
+PUBLIC_IP=""
+
+# Method 1: AWS EC2 metadata (nhanh nhất cho AWS)
+PUBLIC_IP=$(timeout 2 curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
+
+# Method 2: ifconfig.me
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null)
+
+# Method 3: icanhazip.com
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://icanhazip.com 2>/dev/null)
+
+# Method 4: api.ipify.org
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://api.ipify.org 2>/dev/null)
+
+# Fallback: dùng HOST_IP nếu không detect được
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP="$HOST_IP"
+
+echo "📡 Interface: $HOST_NIC"
+echo "📍 Local IP: $HOST_IP/$HOST_CIDR"
+echo "🌍 Public IP: $PUBLIC_IP"
+echo "🚪 Gateway: $HOST_GW"
 echo "🔍 DNS: $HOST_DNS"
+echo ""
+
+# Kiểm tra kết nối internet
+echo "🔌 Testing internet connectivity..."
+if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    echo "✓ Internet connection OK"
+elif ping -c 2 -W 3 "$HOST_GW" >/dev/null 2>&1; then
+    echo "✓ Gateway reachable (internet may be limited)"
+else
+    echo "⚠️  Warning: No connectivity detected, but will proceed anyway"
+fi
 
 # === TINYCORE SETUP ==================================================
 TCE_VERSION="14.x"
@@ -92,7 +137,7 @@ KERNEL_PATH="$BOOT_DIR/vmlinuz64"
 INITRD_PATH="$BOOT_DIR/corepure64.gz"
 INITRD_PATCHED="$BOOT_DIR/corepure64-v8-optimized.gz"
 BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
-GOTTY_URL="https://github.com/yudai/gotty/releases/download/v1.0.1/gotty_linux_amd64.tar.gz"
+GOTTY_URL="https://github.com/sorenisanerd/gotty/releases/download/v1.5.0/gotty_v1.5.0_linux_amd64.tar.gz"
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -120,8 +165,10 @@ mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
 wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL"
 chmod +x "$WORKDIR/srv/busybox"
 
+# Download GoTTY (extract toàn bộ, binary chính là gotty)
 wget -q -O /tmp/gotty.tar.gz "$GOTTY_URL"
-tar -xzf /tmp/gotty.tar.gz -C "$WORKDIR/srv/" gotty
+tar -xzf /tmp/gotty.tar.gz -C /tmp/
+mv /tmp/gotty "$WORKDIR/srv/gotty" 2>/dev/null || cp /tmp/gotty_* "$WORKDIR/srv/gotty" 2>/dev/null
 chmod +x "$WORKDIR/srv/gotty"
 
 # === BOOTLOCAL.SH (OPTIMIZED) ========================================
@@ -136,6 +183,7 @@ HOST_IP="__TC_HOST_IP__"
 HOST_GW="__TC_HOST_GW__"
 HOST_NIC="__TC_HOST_NIC__"
 HOST_DNS="__TC_HOST_DNS__"
+PUBLIC_IP="__TC_PUBLIC_IP__"
 
 exec > /tmp/deploy.log 2>&1
 tail -f /tmp/deploy.log &
@@ -170,9 +218,11 @@ fi
 # === START GOTTY =====================================================
 echo ""
 echo "[GOTTY] Starting web terminal on :$GOTTY_PORT..."
-echo "[GOTTY] Access: http://$HOST_IP:$GOTTY_PORT/"
+echo "[GOTTY] Local:  http://$HOST_IP:$GOTTY_PORT/"
+echo "[GOTTY] Public: http://$PUBLIC_IP:$GOTTY_PORT/"
 
-/srv/gotty -w -p "$GOTTY_PORT" --permit-write \
+/srv/gotty -w -p "$GOTTY_PORT" --address "0.0.0.0" \
+    --permit-write \
     --title-format "TinyCore Deployer - {{ .Hostname }}" \
     /bin/sh -c "tail -f /tmp/deploy.log" &
 
@@ -276,6 +326,7 @@ sed -i "s|__TC_HOST_IP__|$HOST_IP|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_GW__|$HOST_GW|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_NIC__|$HOST_NIC|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_DNS__|$HOST_DNS|g" "$WORKDIR/opt/bootlocal.sh"
+sed -i "s|__TC_PUBLIC_IP__|$PUBLIC_IP|g" "$WORKDIR/opt/bootlocal.sh"
 
 chmod +x "$WORKDIR/opt/bootlocal.sh"
 
@@ -298,7 +349,8 @@ echo "=========================================="
 echo "✅ Ready to boot!"
 echo "=========================================="
 echo "🌐 GoTTY will be available at:"
-echo "   http://$HOST_IP:$GOTTY_PORT/"
+echo "   Local:  http://$HOST_IP:$GOTTY_PORT/"
+echo "   Public: http://$PUBLIC_IP:$GOTTY_PORT/"
 echo ""
 echo "📊 Monitor deployment progress there"
 echo "🎯 Target disk: $TARGET_DISK"
