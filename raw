@@ -183,15 +183,17 @@ HOST_NIC="__TC_HOST_NIC__"
 HOST_DNS="__TC_HOST_DNS__"
 PUBLIC_IP="__TC_PUBLIC_IP__"
 
-exec > /tmp/deploy.log 2>&1
-tail -f /tmp/deploy.log &
+# Tạo log file ngay từ đầu
+touch /tmp/deploy.log
+echo "=========================================="  > /tmp/deploy.log
+echo "🚀 TinyCore v8 - ttyd Optimized Deployer" >> /tmp/deploy.log
+echo "==========================================" >> /tmp/deploy.log
+echo "Target: $TARGET_DISK | Boot: $BOOT_DISK"   >> /tmp/deploy.log
+echo "Network: $HOST_IP via $HOST_NIC"           >> /tmp/deploy.log
+date >> /tmp/deploy.log
 
-echo "=========================================="
-echo "🚀 TinyCore v8 - GoTTY Optimized Deployer"
-echo "=========================================="
-echo "Target: $TARGET_DISK | Boot: $BOOT_DISK"
-echo "Network: $HOST_IP via $HOST_NIC"
-date
+# Redirect all output to log
+exec >> /tmp/deploy.log 2>&1
 
 # === NETWORK SETUP (KẾ THỪA TỪ HOST) ================================
 echo ""
