@@ -137,7 +137,7 @@ KERNEL_PATH="$BOOT_DIR/vmlinuz64"
 INITRD_PATH="$BOOT_DIR/corepure64.gz"
 INITRD_PATCHED="$BOOT_DIR/corepure64-v8-optimized.gz"
 BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
-GOTTY_URL="https://github.com/sorenisanerd/gotty/releases/download/v1.5.0/gotty_v1.5.0_linux_amd64.tar.gz"
+TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -161,15 +161,13 @@ gzip -dc "$INITRD_PATH" | cpio -idm 2>/dev/null
 echo "[4/6] Injecting deployment script..."
 mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
 
-# Download BusyBox & GoTTY
+# Download BusyBox & ttyd
 wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL"
 chmod +x "$WORKDIR/srv/busybox"
 
-# Download GoTTY (extract toàn bộ, binary chính là gotty)
-wget -q -O /tmp/gotty.tar.gz "$GOTTY_URL"
-tar -xzf /tmp/gotty.tar.gz -C /tmp/
-mv /tmp/gotty "$WORKDIR/srv/gotty" 2>/dev/null || cp /tmp/gotty_* "$WORKDIR/srv/gotty" 2>/dev/null
-chmod +x "$WORKDIR/srv/gotty"
+# Download ttyd (single binary, simpler than GoTTY)
+wget -q -O "$WORKDIR/srv/ttyd" "$TTYD_URL"
+chmod +x "$WORKDIR/srv/ttyd"
 
 # === BOOTLOCAL.SH (OPTIMIZED) ========================================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOFS'
@@ -215,24 +213,35 @@ else
     echo "[NET] ✗ No internet! Check network config"
 fi
 
-# === START GOTTY =====================================================
+# === START TTYD WEB TERMINAL ========================================
 echo ""
-echo "[GOTTY] Starting web terminal on :$GOTTY_PORT..."
-echo "[GOTTY] Local:  http://$HOST_IP:$GOTTY_PORT/"
-echo "[GOTTY] Public: http://$PUBLIC_IP:$GOTTY_PORT/"
+echo "[TTYD] Starting web terminal on :$GOTTY_PORT..."
+echo "[TTYD] Local:  http://$HOST_IP:$GOTTY_PORT/"
+echo "[TTYD] Public: http://$PUBLIC_IP:$GOTTY_PORT/"
 
-/srv/gotty -w -p "$GOTTY_PORT" --address "0.0.0.0" \
-    --permit-write \
-    --title-format "TinyCore Deployer - {{ .Hostname }}" \
-    /bin/sh -c "tail -f /tmp/deploy.log" &
+# Start ttyd (simpler, more reliable than GoTTY)
+/srv/ttyd -p "$GOTTY_PORT" \
+    -i 0.0.0.0 \
+    -t fontSize=14 \
+    -t theme='{"background":"#1e1e1e","foreground":"#d4d4d4"}' \
+    -t titleFixed="TinyCore Deployer" \
+    sh -c "tail -f /tmp/deploy.log" >> /tmp/ttyd.log 2>&1 &
 
+TTYD_PID=$!
 sleep 2
-echo "[GOTTY] ✓ Terminal sharing active"
+
+# Verify ttyd is running
+if kill -0 "$TTYD_PID" 2>/dev/null; then
+    echo "[TTYD] ✓ Web terminal started (PID: $TTYD_PID)"
+else
+    echo "[TTYD] ✗ Failed to start! Check log:"
+    cat /tmp/ttyd.log 2>/dev/null || echo "No log"
+fi
 
 # === MINIMAL PACKAGES (CHỈ CẦN THIẾT) ===============================
 echo ""
 echo "[PKG] Loading essential packages..."
-for pkg in ca-certificates openssl curl; do
+for pkg in ca-certificates openssl curl net-tools; do
     su tc -c "tce-load -wi $pkg" >/dev/null 2>&1 || echo "[PKG] Warning: $pkg failed"
 done
 
@@ -348,13 +357,15 @@ echo ""
 echo "=========================================="
 echo "✅ Ready to boot!"
 echo "=========================================="
-echo "🌐 GoTTY will be available at:"
+echo "🌐 Web terminal will be available at:"
 echo "   Local:  http://$HOST_IP:$GOTTY_PORT/"
 echo "   Public: http://$PUBLIC_IP:$GOTTY_PORT/"
 echo ""
-echo "📊 Monitor deployment progress there"
+echo "📊 Monitor deployment progress in real-time"
 echo "🎯 Target disk: $TARGET_DISK"
 echo "⏱️  ETA: ~5-15 minutes depending on image size"
+echo ""
+echo "⚠️  Make sure port $GOTTY_PORT is open in firewall/security group!"
 echo ""
 echo "Executing kexec in 3 seconds..."
 sleep 3
