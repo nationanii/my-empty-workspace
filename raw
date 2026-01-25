@@ -1,179 +1,207 @@
 #!/bin/bash
-set -euo pipefail
-
+set -u
 # =====================================================================
-# TinyCore Deployer v8-gotty-static-speed
-# - Monitor: GoTTY (Realtime Web Terminal)
-# - Network: Static IP (Inherit from Host) - No DHCP waiting
-# - Disk: Auto-detect Root Disk on Host -> Pass to TinyCore
-# - Optimization: Minimal extensions, Pre-downloaded binaries
+# TinyCore Deployer v20-Stable-Ultimate
+# - MONITOR: GoTTY Web Terminal (Port 80)
+# - NETWORK: Static IP Passthrough (Bypass Docker/VPN)
+# - DISK: Smart Detect + Auto Wipe
+# - STORAGE: Auto Expand Partition + Force NTFS Resize
 # =====================================================================
 
 # === CONFIG ==========================================================
-GZ_LINK="https://is.gd/ZubYbG"   # Link file .img.gz
+# Link file .img.gz của bạn
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"
+
+# Link công cụ Web Monitor
 GOTTY_URL="https://github.com/yudai/gotty/releases/download/v1.0.1/gotty_linux_amd64.tar.gz"
 
-# === 1. PREPARE HOST INFO (NET & DISK) ===============================
-echo "[1/7] Detecting Host Network & Disk..."
+# Link Bootfix (Grub) - Đề phòng trường hợp cần thiết
+SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
-# Detect Network Interface
-MAIN_IF=$(ip route get 1.1.1.1 | grep -oP 'dev \K\S+')
-# Detect IP/CIDR (Example: 103.1.1.5/24)
-HOST_IP_CIDR=$(ip -4 addr show "$MAIN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
-# Detect Gateway
-HOST_GW=$(ip route | grep default | awk '{print $3}' | head -n1)
-# Detect Root Disk (Disk chứa phân vùng /)
+# === 1. THU THẬP THÔNG TIN TỪ MÁY HIỆN TẠI (HOST) ====================
+echo "[1/6] Detecting Host Configuration..."
+
+# 1.1 Tìm Card mạng thật (Bỏ qua Docker/VPN)
+MAIN_IF=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -n1)
+HOST_IP=$(ip -4 addr show "$MAIN_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
+HOST_GW=$(ip route | grep default | grep "$MAIN_IF" | awk '{print $3}' | head -n1)
+
+# 1.2 Tìm Ổ đĩa gốc (Root Disk)
 ROOT_PART=$(findmnt -n / -o SOURCE)
-# Lấy tên ổ đĩa gốc (vd: /dev/vda từ /dev/vda1)
 HOST_DISK="/dev/$(lsblk -no pkname "$ROOT_PART" | head -n1)"
 
-if [ -z "$HOST_IP_CIDR" ] || [ -z "$HOST_GW" ] || [ -z "$HOST_DISK" ]; then
-    echo "ERROR: Could not detect Network or Disk info."
-    echo "IP: $HOST_IP_CIDR, GW: $HOST_GW, DISK: $HOST_DISK"
+if [ -z "$HOST_IP" ] || [ -z "$HOST_GW" ] || [ -z "$HOST_DISK" ]; then
+    echo "FATAL ERROR: Không tìm thấy thông tin mạng hoặc đĩa."
+    echo "Debug: IF=$MAIN_IF | IP=$HOST_IP | GW=$HOST_GW | DISK=$HOST_DISK"
     exit 1
 fi
 
-echo " -> Network: $HOST_IP_CIDR (GW: $HOST_GW)"
-echo " -> Target Disk: $HOST_DISK"
+echo " -> Network: $HOST_IP (GW: $HOST_GW)"
+echo " -> Disk:    $HOST_DISK"
 
-# === 2. INSTALL HOST DEPS ============================================
-echo "[2/7] Installing dependencies..."
+# === 2. CÀI ĐẶT CÔNG CỤ CẦN THIẾT TRÊN HOST ==========================
+echo "[2/6] Preparing Environment..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get -y -qq update
 apt-get -y -qq install wget curl gzip cpio kexec-tools tar --no-install-recommends
 
-# === 3. PREPARE TINYCORE FILES =======================================
-echo "[3/7] Downloading TinyCore & Tools..."
+# === 3. TẢI TINYCORE & GOTTY VỀ Ổ CỨNG (ĐỂ ĐÓNG GÓI) =================
+echo "[3/6] Downloading Artifacts..."
 WORKDIR="/tmp/tc_build"
-rm -rf "$WORKDIR" && mkdir -p "$WORKDIR/opt" "$WORKDIR/bin"
+rm -rf "$WORKDIR" && mkdir -p "$WORKDIR/bin" "$WORKDIR/rootfs"
 
+# Tải Kernel & Initrd gốc
 TCE_MIRROR="http://tinycorelinux.net/14.x/x86_64/release/distribution_files"
 wget -q -O "$WORKDIR/vmlinuz64" "$TCE_MIRROR/vmlinuz64"
 wget -q -O "$WORKDIR/corepure64.gz" "$TCE_MIRROR/corepure64.gz"
 
-# Download GoTTY (Static binary)
-echo " -> Downloading GoTTY..."
+# Tải GoTTY
 wget -q -O "$WORKDIR/gotty.tar.gz" "$GOTTY_URL"
 tar -xzf "$WORKDIR/gotty.tar.gz" -C "$WORKDIR/bin/"
 chmod +x "$WORKDIR/bin/gotty"
-rm "$WORKDIR/gotty.tar.gz"
 
-# === 4. UNPACK & INJECT INITRD =======================================
-echo "[4/7] Injecting scripts into Initrd..."
-mkdir -p "$WORKDIR/rootfs"
+# === 4. CHỈNH SỬA INITRD (NẠP CODE VÀO RAM DISK) =====================
+echo "[4/6] Injecting Smart Scripts..."
 cd "$WORKDIR/rootfs"
 gzip -dc "../corepure64.gz" | cpio -idmv >/dev/null 2>&1
 
-# Copy GoTTY to rootfs
+# Copy GoTTY vào hệ thống file của TinyCore
 cp "$WORKDIR/bin/gotty" "$WORKDIR/rootfs/usr/local/bin/"
 
-# Create bootlocal.sh
+# Tạo script chạy tự động khi TinyCore boot
 cat > "$WORKDIR/rootfs/opt/bootlocal.sh" <<'EOF'
 #!/bin/sh
-# --- TINYCORE BOOT SCRIPT ---
+# --- TINYCORE RAM SCRIPT ---
 LOG="/tmp/install.log"
 touch $LOG
 
-# Helper to log
-log() { echo "[$1] $2"; echo "[$1] $2" >> $LOG; }
+# Hàm ghi log
+log() { echo "[$1] $2" | tee -a $LOG; }
 
-# 1. Parse Kernel Cmdline for Configs
+# 1. Nhận biến môi trường từ Host
 for x in $(cat /proc/cmdline); do
   case "$x" in
     tc_ip=*) MY_IP="${x#*=}" ;;
     tc_gw=*) MY_GW="${x#*=}" ;;
     tc_disk=*) MY_DISK="${x#*=}" ;;
     tc_img=*) IMG_URL="${x#*=}" ;;
+    tc_swap=*) SWAP_URL="${x#*=}" ;;
   esac
 done
 
-# 2. Start GoTTY (Port 80, Read-only view of the log)
-# Running in background so it doesn't block
-log "GOTTY" "Starting Web Terminal on Port 80..."
-/usr/local/bin/gotty -p 80 -w=false --title-format "TinyCore Installer" tail -f $LOG &
-
-# 3. Configure Network (Static - Instant)
-log "NET" "Configuring Static IP: $MY_IP"
-ifconfig eth0 $MY_IP up
+# 2. Cấu hình Mạng (IP Tĩnh - Có mạng ngay lập tức)
+log "NET" "Applying Static Config: $MY_IP via $MY_GW"
+ifconfig eth0 "${MY_IP%/*}" netmask 255.255.255.0 up
 route add default gw $MY_GW
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 
-# 4. Check Network
-log "NET" "Checking connectivity..."
-if wget -q --spider http://google.com; then
-    log "NET" "Online! Ready to download."
-else
-    log "NET" "ERROR: No internet connection."
-    log "NET" "Debug: $(ifconfig eth0)"
-    log "NET" "Debug: $(route -n)"
-    sleep 10
-    reboot -f
-fi
+# 3. Kích hoạt Web Monitor (Port 80)
+log "WEB" "Starting GoTTY on Port 80..."
+/usr/local/bin/gotty -p 80 -w=false --title-format "TinyCore Installer" tail -f $LOG &
 
-# 5. Prepare Disk
-if [ ! -b "$MY_DISK" ]; then
-    log "ERR" "Target disk $MY_DISK not found!"
-    lsblk >> $LOG
-    sleep 10
-    reboot -f
-fi
+# 4. Tải các gói phần mềm cần thiết (Retry loop)
+log "PKG" "Downloading tools (parted, ntfs-3g)..."
+install_pkg() {
+  for i in 1 2 3; do
+    su tc -c "tce-load -wi $1" >> $LOG 2>&1 && return 0
+    sleep 2
+  done
+  log "PKG" "Error loading $1"
+}
+install_pkg "ca-certificates.tcz"
+install_pkg "curl.tcz"
+install_pkg "parted"
+install_pkg "gdisk"
+install_pkg "ntfs-3g.tcz" # Quan trọng cho ntfsfix/resize
 
+# 5. Xử lý ổ đĩa
 log "DISK" "Target: $MY_DISK"
-log "DISK" "Unmounting partitions..."
+log "DISK" "Wiping partition table..."
 umount ${MY_DISK}* 2>/dev/null || true
 swapoff -a
+dd if=/dev/zero of="$MY_DISK" bs=1M count=10 conv=fsync >> $LOG 2>&1
 
-# 6. Stream Install (Wget | Gunzip | DD)
-log "INS" "Downloading & Writing Image..."
-log "INS" "Source: $IMG_URL"
-
-# Pipe with progress tracking via file size (rough estimate) or just generic wait
-wget --no-check-certificate -O- "$IMG_URL" 2>>$LOG \
+# 6. Tải và Ghi Image
+log "INS" "Streaming Image from URL..."
+# Dùng curl -L để follow redirect, pipe vào dd
+curl -L -k -f "$IMG_URL" 2>>$LOG \
 | gunzip -c \
 | dd of="$MY_DISK" bs=4M conv=fsync 2>>$LOG
+RC=$?
 
-if [ $? -eq 0 ]; then
-    log "DONE" "Installation Complete!"
-    log "SYS" "Rebooting in 5 seconds..."
-    sleep 5
+if [ $RC -eq 0 ]; then
+    log "DONE" "Image written successfully."
+    
+    # --- AUTO EXPAND & RESIZE LOGIC ---
+    log "EXPAND" "Fixing GPT & Resizing..."
+    
+    # 6.1 Fix GPT Header
+    sgdisk -e "$MY_DISK" >> $LOG 2>&1
+    partprobe "$MY_DISK"
+    sleep 2
+    
+    # 6.2 Tìm và Xóa phân vùng Recovery (Nếu có)
+    LAST_PART=$(parted -m "$MY_DISK" print 2>/dev/null | tail -n 1 | awk -F: '{print $1}')
+    if [ -n "$LAST_PART" ] && [ "$LAST_PART" -ge 3 ]; then
+        log "EXPAND" "Deleting Recovery Partition #$LAST_PART"
+        parted -s "$MY_DISK" rm "$LAST_PART" >> $LOG 2>&1
+        LAST_PART=$((LAST_PART - 1))
+    fi
+    
+    # 6.3 Mở rộng phân vùng C: (Vỏ)
+    if [ -n "$LAST_PART" ]; then
+        log "EXPAND" "Resizing Partition #$LAST_PART to 100%"
+        parted -s "$MY_DISK" resizepart "$LAST_PART" 100% >> $LOG 2>&1
+        
+        # 6.4 Mở rộng NTFS (Ruột) - Dùng ntfsresize
+        PART_DEV="${MY_DISK}${LAST_PART}"
+        echo "$MY_DISK" | grep -q "nvme" && PART_DEV="${MY_DISK}p${LAST_PART}"
+        
+        if [ -b "$PART_DEV" ]; then
+             log "NTFS" "Fixing & Resizing Filesystem on $PART_DEV..."
+             ntfsfix -b -d "$PART_DEV" >> $LOG 2>&1
+             ntfsresize -f -f -v "$PART_DEV" >> $LOG 2>&1
+        fi
+    fi
+
+    # 7. Bootfix (Nếu cần)
+    if [ "$MY_DISK" != "/dev/sda" ] && [ -b "/dev/sda" ]; then
+        log "FIX" "Writing Bootsector to /dev/sda just in case..."
+        curl -L -k -o /tmp/grub.gz "$SWAP_URL"
+        gunzip -c /tmp/grub.gz | dd of=/dev/sda bs=4M 2>>$LOG
+    fi
+
+    log "SYS" "ALL DONE. Rebooting in 10 seconds..."
+    sleep 10
     reboot -f
 else
-    log "ERR" "Pipeline failed. Check logs above."
+    log "FATAL" "Install Failed (rc=$RC). System will hang for 1 hour for debugging."
     sleep 3600
 fi
 EOF
 
 chmod +x "$WORKDIR/rootfs/opt/bootlocal.sh"
-
-# Ensure bootlocal runs
 echo "/opt/bootlocal.sh &" >> "$WORKDIR/rootfs/opt/bootsync.sh"
 
-# === 5. REPACK INITRD ================================================
-echo "[5/7] Repacking Initrd..."
+# === 5. ĐÓNG GÓI INITRD ==============================================
+echo "[5/6] Repacking Initrd..."
 find . | cpio -o -H newc | gzip -c > "$WORKDIR/corepure64-custom.gz"
 
-# === 6. EXECUTE KEXEC ================================================
-echo "[6/7] Preparing Kexec..."
+# === 6. CHUYỂN GIAO CHO TINYCORE (KEXEC) =============================
+echo "[6/6] Kexecuting..."
 
-# Construct Kernel Command Line with Host Variables
-# tc_ip: CIDR format (e.g., 10.0.0.2/24) is supported by busybox ifconfig in some versions,
-# but to be safe we rely on ip command if available, or ifconfig.
-# TinyCore default ifconfig might need mask separately.
-# Hack: Let's assume user has standard CIDR.
-CMDLINE="console=ttyS0 quiet tc_ip=${HOST_IP_CIDR} tc_gw=${HOST_GW} tc_disk=${HOST_DISK} tc_img=${GZ_LINK}"
+# Truyền tham số mạng và đĩa vào TinyCore
+CMDLINE="console=ttyS0 quiet tc_ip=${HOST_IP} tc_gw=${HOST_GW} tc_disk=${HOST_DISK} tc_img=${GZ_LINK} tc_swap=${SWAP_URL}"
 
-echo "---------------------------------------------"
-echo "TARGET IP  : http://${HOST_IP_CIDR%/*}"
-echo "TARGET DISK: ${HOST_DISK}"
-echo "---------------------------------------------"
-echo "WARNING: System will takeover in 3 seconds."
-echo "Visit http://${HOST_IP_CIDR%/*} to view progress via GoTTY."
-sleep 3
+echo "========================================================="
+echo "  MONITOR URL: http://${HOST_IP%/*}/"
+echo "  (Hãy mở link này trên trình duyệt để xem cài đặt)"
+echo "========================================================="
+echo "VPS sẽ reboot và cài đặt tự động trong 5 giây..."
+sleep 5
 
 kexec -l "$WORKDIR/vmlinuz64" \
       --initrd="$WORKDIR/corepure64-custom.gz" \
       --command-line="$CMDLINE"
 
-echo "[7/7] BOOM! Goodbye Linux..."
 kexec -e
