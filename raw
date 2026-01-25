@@ -172,6 +172,10 @@ chmod +x "$WORKDIR/srv/ttyd"
 # === BOOTLOCAL.SH (OPTIMIZED) ========================================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOFS'
 #!/bin/sh
+
+if [ -f /tmp/deploy_running ]; then exit 0; fi
+touch /tmp/deploy_running
+
 IMAGE_URL="__TC_GZ_LINK__"
 TARGET_DISK="__TC_TARGET_DISK__"
 BOOT_DISK="__TC_BOOT_DISK__"
