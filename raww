@@ -1,77 +1,145 @@
 #!/bin/bash
 set -euo pipefail
-
 # =====================================================================
-# TinyCore Auto Windows Deployer v8-gotty-optimized (CLEANED)
+# TinyCore Auto Windows Deployer v9-enhanced
+# NEW FEATURES:
+# - Xóa phân vùng Recovery sau khi cài đặt
+# - Mở rộng phân vùng boot lên 100%
+# - Tùy chọn wipe các ổ cứng khác (WIPE_OTHER_DISKS)
+# - Thứ tự: Deploy → Delete Recovery → Expand → Wipe Others → Reboot
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Link file .gz
-GOTTY_PORT="80"                                       # Port web terminal
-SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz" # Grub fix (nếu cần)
-FINDHD="true"                                          # Format ổ đĩa phụ (true/false)
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Windows .img.gz URL
+GOTTY_PORT="80"                 # GoTTY web terminal port
+SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
+WIPE_OTHER_DISKS="true"          # true = xóa tất cả ổ cứng khác, false = giữ nguyên
 
-# =====================================================================
-# GIAI ĐOẠN 1: HOST DETECTION (CHẠY TRÊN OS HIỆN TẠI)
-# =====================================================================
-
+# === AUTO-DETECT TARGET DISK (TRƯỚC KHI BOOT TINYCORE) ==============
 echo "=========================================="
 echo "🔍 Detecting boot disk..."
 echo "=========================================="
 
-# 1. Phát hiện Disk
+# Lấy boot disk (disk chứa root filesystem hiện tại)
 BOOT_DISK=$(lsblk -ndo PKNAME $(findmnt -n -o SOURCE /) 2>/dev/null | head -1)
 if [ -z "$BOOT_DISK" ]; then
+    # Fallback: tìm disk có mount point /
     BOOT_DISK=$(lsblk -ndo PKNAME $(mount | grep ' / ' | awk '{print $1}') 2>/dev/null | head -1)
 fi
 if [ -z "$BOOT_DISK" ]; then
+    # Fallback cuối: tìm disk đầu tiên
     BOOT_DISK=$(lsblk -ndo NAME,TYPE | awk '$2=="disk"{print $1; exit}')
 fi
 
 TARGET_DISK="/dev/$BOOT_DISK"
+
 echo "🎯 Boot disk found: $TARGET_DISK"
+echo ""
 
+# Hiển thị thông tin chi tiết
 echo "📊 Current disk layout:"
+echo "----------------------------------------"
 lsblk "$TARGET_DISK" -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL
-echo ""
-echo "⚠️  WARNING: $TARGET_DISK will be completely wiped!"
+echo "----------------------------------------"
 echo ""
 
-# 2. Phát hiện Network
+# Hiển thị tất cả disks để user biết
+echo "📀 All available disks on system:"
+lsblk -ndo NAME,SIZE,TYPE,MODEL | awk '$3=="disk"{print "  - /dev/"$1" ("$2") "$4}'
+echo ""
+
+# Đếm số ổ cứng khác (ngoài TARGET_DISK)
+OTHER_DISKS_COUNT=$(lsblk -ndo NAME,TYPE | awk -v target="$BOOT_DISK" '$2=="disk" && $1!=target {count++} END {print count+0}')
+echo "ℹ️  This script will use the BOOT DISK: $TARGET_DISK"
+echo "   (The disk where your current OS is running)"
+echo ""
+echo "⚠️  WARNING: $TARGET_DISK will be completely wiped"
+echo "   All data will be DESTROYED and replaced with Windows"
+echo ""
+
+if [ "$WIPE_OTHER_DISKS" = "true" ]; then
+    echo "⚠️  WIPE_OTHER_DISKS is ENABLED!"
+    echo "   Found $OTHER_DISKS_COUNT other disk(s) that will be wiped"
+    lsblk -ndo NAME,SIZE,TYPE | awk -v target="$BOOT_DISK" '$2=="disk" && $1!=target {print "   - /dev/"$1" ("$2")"}'
+    echo "   All these disks will be COMPLETELY ERASED after Windows installation"
+    echo ""
+else
+    echo "ℹ️  WIPE_OTHER_DISKS is disabled (found $OTHER_DISKS_COUNT other disk(s) that will be preserved)"
+    echo ""
+fi
+
+# Biến BOOT_DISK = TARGET_DISK (vì ta ghi đè lên chính disk đang boot)
+BOOT_DISK="$TARGET_DISK"
+
+# === DETECT NETWORK CONFIG FROM HOST =================================
+echo ""
 echo "🌐 Detecting network configuration..."
+
+# Lấy interface đang active (có default route)
 HOST_NIC=$(ip route show default | head -1 | grep -oP 'dev \K\S+')
 [ -z "$HOST_NIC" ] && HOST_NIC=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
 [ -z "$HOST_NIC" ] && HOST_NIC="eth0"
 
+# Lấy IP local (private/public)
 HOST_IP=$(ip -4 addr show dev "$HOST_NIC" | grep -oP 'inet \K[\d.]+' | head -1)
-[ -z "$HOST_IP" ] && HOST_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | head -1)
 
+# Nếu không có IP trên NIC đó, lấy bất kỳ IP nào (trừ 127.0.0.1)
+if [ -z "$HOST_IP" ]; then
+    HOST_IP=$(ip -4 addr show | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | head -1)
+fi
+
+# Lấy gateway
 HOST_GW=$(ip route show default | head -1 | awk '{print $3}')
 if [ -z "$HOST_GW" ]; then
+    # Fallback: tính gateway từ IP (thay byte cuối = 1)
     HOST_GW="$(echo $HOST_IP | cut -d. -f1-3).1"
 fi
 
+# Lấy netmask/prefix (ví dụ: 24 từ 10.0.1.179/24)
 HOST_CIDR=$(ip -4 addr show dev "$HOST_NIC" | grep -oP 'inet [\d.]+/\K\d+' | head -1)
 [ -z "$HOST_CIDR" ] && HOST_CIDR="24"
 
+# Lấy nameserver
 HOST_DNS=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
 [ -z "$HOST_DNS" ] && HOST_DNS="1.1.1.1"
 
-# 3. Detect Public IP
+# === DETECT PUBLIC IP (cho GoTTY access) =============================
 echo "🔍 Detecting public IPv4..."
-PUBLIC_IP=$(timeout 2 curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
-[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null || true)
+PUBLIC_IP=""
+
+# Method 1: AWS EC2 metadata (nhanh nhất cho AWS)
+PUBLIC_IP=$(timeout 2 curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
+
+# Method 2: ifconfig.me
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null)
+
+# Method 3: icanhazip.com
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://icanhazip.com 2>/dev/null)
+
+# Method 4: api.ipify.org
+[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://api.ipify.org 2>/dev/null)
+
+# Fallback: dùng HOST_IP nếu không detect được
 [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$HOST_IP"
 
 echo "📡 Interface: $HOST_NIC"
-echo "📍 Local IP:  $HOST_IP/$HOST_CIDR"
+echo "📍 Local IP: $HOST_IP/$HOST_CIDR"
 echo "🌍 Public IP: $PUBLIC_IP"
-echo "🚪 Gateway:   $HOST_GW"
+echo "🚪 Gateway: $HOST_GW"
+echo "🔍 DNS: $HOST_DNS"
+echo ""
 
-# =====================================================================
-# GIAI ĐOẠN 2: PREPARE TINYCORE ENVIRONMENT
-# =====================================================================
+# Kiểm tra kết nối internet
+echo "🔌 Testing internet connectivity..."
+if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    echo "✓ Internet connection OK"
+elif ping -c 2 -W 3 "$HOST_GW" >/dev/null 2>&1; then
+    echo "✓ Gateway reachable (internet may be limited)"
+else
+    echo "⚠️  Warning: No connectivity detected, but will proceed anyway"
+fi
 
+# === TINYCORE SETUP ==================================================
 TCE_VERSION="14.x"
 ARCH="x86_64"
 TCE_MIRROR="http://tinycorelinux.net"
@@ -81,40 +149,74 @@ KERNEL_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/vmlinuz64"
 INITRD_URL="$TCE_MIRROR/$TCE_VERSION/$ARCH/release/distribution_files/corepure64.gz"
 KERNEL_PATH="$BOOT_DIR/vmlinuz64"
 INITRD_PATH="$BOOT_DIR/corepure64.gz"
-INITRD_PATCHED="$BOOT_DIR/corepure64-v8-optimized.gz"
+INITRD_PATCHED="$BOOT_DIR/corepure64-v9-enhanced.gz"
 BUSYBOX_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/busybox"
 TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64"
+NTFSRESIZE_URL="https://github.com/tuxera/ntfs-3g/releases/download/2022.10.3/ntfs-3g_ntfsprogs-2022.10.3.tgz"
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 echo ""
 echo "[1/6] Installing dependencies..."
 apt-get -y -qq update
-apt-get -y -qq install wget curl gzip cpio kexec-tools ca-certificates --no-install-recommends
+apt-get -y -qq install wget curl gzip cpio kexec-tools ca-certificates parted ntfs-3g --no-install-recommends
 
 mkdir -p "$BOOT_DIR" "$WORKDIR"
 
 echo "[2/6] Downloading TinyCore kernel & initrd..."
 wget -q --show-progress -O "$KERNEL_PATH" "$KERNEL_URL" &
 wget -q --show-progress -O "$INITRD_PATH" "$INITRD_URL" &
-wait
+wait  # Download song song
 
 echo "[3/6] Unpacking initrd..."
 cd "$WORKDIR"
 gzip -dc "$INITRD_PATH" | cpio -idm 2>/dev/null
 
-echo "[4/6] Injecting tools..."
-mkdir -p "$WORKDIR/srv" "$WORKDIR/opt"
-wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL" && chmod +x "$WORKDIR/srv/busybox"
-wget -q -O "$WORKDIR/srv/ttyd" "$TTYD_URL" && chmod +x "$WORKDIR/srv/ttyd"
+echo "[4/6] Injecting deployment script..."
+mkdir -p "$WORKDIR/srv" "$WORKDIR/opt" "$WORKDIR/usr/local/bin"
 
-# =====================================================================
-# GIAI ĐOẠN 3: CREATE BOOTLOCAL.SH (RUNTIME SCRIPT)
-# =====================================================================
-# Script này sẽ chạy BÊN TRONG TinyCore sau khi reboot
+# Download BusyBox & ttyd
+wget -q -O "$WORKDIR/srv/busybox" "$BUSYBOX_URL"
+chmod +x "$WORKDIR/srv/busybox"
+
+# Download ttyd (single binary, simpler than GoTTY)
+wget -q -O "$WORKDIR/srv/ttyd" "$TTYD_URL"
+chmod +x "$WORKDIR/srv/ttyd"
+
+# Copy ntfsresize from host system
+echo "Copying ntfsresize and dependencies..."
+if command -v ntfsresize >/dev/null 2>&1; then
+    # Copy ntfsresize binary
+    cp "$(which ntfsresize)" "$WORKDIR/usr/local/bin/" 2>/dev/null || true
+    
+    # Copy required libraries
+    mkdir -p "$WORKDIR/lib" "$WORKDIR/lib64" "$WORKDIR/usr/lib" "$WORKDIR/usr/lib/x86_64-linux-gnu"
+    
+    # Find and copy dependencies
+    for lib in $(ldd "$(which ntfsresize)" 2>/dev/null | grep -oP '/\S+' | grep -v '=>'); do
+        if [ -f "$lib" ]; then
+            cp -L "$lib" "$WORKDIR/usr/lib/x86_64-linux-gnu/" 2>/dev/null || \
+            cp -L "$lib" "$WORKDIR/lib64/" 2>/dev/null || \
+            cp -L "$lib" "$WORKDIR/lib/" 2>/dev/null || true
+        fi
+    done
+    
+    # Copy additional ntfs-3g binaries that might be useful
+    for tool in ntfsfix ntfsclone; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            cp "$(which $tool)" "$WORKDIR/usr/local/bin/" 2>/dev/null || true
+        fi
+    done
+    
+    echo "✓ ntfsresize and dependencies copied"
+else
+    echo "⚠️  ntfsresize not found on host, will skip NTFS resize in TinyCore"
+fi
+
+# === BOOTLOCAL.SH (ENHANCED WITH PARTITION MANAGEMENT) ===============
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOFS'
 #!/bin/sh
-# --- Variables injected by sed ---
 IMAGE_URL="__TC_GZ_LINK__"
 TARGET_DISK="__TC_TARGET_DISK__"
 BOOT_DISK="__TC_BOOT_DISK__"
@@ -125,139 +227,402 @@ HOST_GW="__TC_HOST_GW__"
 HOST_NIC="__TC_HOST_NIC__"
 HOST_DNS="__TC_HOST_DNS__"
 PUBLIC_IP="__TC_PUBLIC_IP__"
-FINDHD="__TC_FINDHD__"
+WIPE_OTHER_DISKS="__TC_WIPE_OTHER_DISKS__"
 
-# --- Logging Setup ---
+# Tạo log file ngay từ đầu
 touch /tmp/deploy.log
+echo "=========================================="  > /tmp/deploy.log
+echo "🚀 TinyCore v9 - Enhanced Deployer"      >> /tmp/deploy.log
+echo "==========================================" >> /tmp/deploy.log
+echo "Target: $TARGET_DISK | Boot: $BOOT_DISK"   >> /tmp/deploy.log
+echo "Network: $HOST_IP via $HOST_NIC"           >> /tmp/deploy.log
+echo "Wipe Others: $WIPE_OTHER_DISKS"            >> /tmp/deploy.log
+date >> /tmp/deploy.log
+
+# Redirect all output to log
 exec >> /tmp/deploy.log 2>&1
-echo "🚀 TinyCore Deployer Started at $(date)"
-echo "Target: $TARGET_DISK | IP: $HOST_IP"
 
-# --- Network Setup ---
-echo "[NET] Configuring network..."
+# === NETWORK SETUP (KẾ THỪA TỪ HOST) ================================
+echo ""
+echo "[NET] Configuring network from host..."
 ip link set lo up
-# TinyCore thường nhận eth0 là interface chính
-ip link set eth0 up 2>/dev/null
-ip link set "$HOST_NIC" up 2>/dev/null
+ip link set "$HOST_NIC" up
 
-ip addr add "$HOST_IP/24" dev "$HOST_NIC" 2>/dev/null || ip addr add "$HOST_IP/24" dev eth0
-ip route add default via "$HOST_GW" 2>/dev/null
+# Static IP từ host
+ip addr add "$HOST_IP/24" dev "$HOST_NIC" 2>/dev/null || \
+ip addr add "$HOST_IP/16" dev "$HOST_NIC"
+
+ip route add default via "$HOST_GW" dev "$HOST_NIC" 2>/dev/null
 echo "nameserver $HOST_DNS" > /etc/resolv.conf
 
-# --- Start TTYD Web Terminal ---
-echo "[TTYD] Starting web terminal..."
+echo "[NET] Testing connectivity..."
+if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    echo "[NET] ✓ Internet OK"
+else
+    echo "[NET] ✗ No internet! Check network config"
+fi
+
+# === START TTYD WEB TERMINAL ========================================
+echo ""
+echo "[TTYD] Starting web terminal on :$GOTTY_PORT..."
+echo "[TTYD] Local:  http://$HOST_IP:$GOTTY_PORT/"
+echo "[TTYD] Public: http://$PUBLIC_IP:$GOTTY_PORT/"
+
+# Tạo wrapper script để ttyd luôn có process chạy
 cat > /tmp/ttyd_wrapper.sh <<'WRAPPER'
 #!/bin/sh
 while true; do
-    if [ -f /tmp/deploy.log ]; then tail -f /tmp/deploy.log; else echo "Waiting..."; sleep 1; fi
+    if [ -f /tmp/deploy.log ]; then
+        tail -f /tmp/deploy.log
+    else
+        echo "Waiting for deployment to start..."
+        sleep 1
+    fi
 done
 WRAPPER
 chmod +x /tmp/ttyd_wrapper.sh
 
-/srv/ttyd -p "$GOTTY_PORT" -i 0.0.0.0 -t fontSize=14 /tmp/ttyd_wrapper.sh &
+# Start ttyd với wrapper (không bao giờ exit)
+/srv/ttyd -p "$GOTTY_PORT" \
+    -i 0.0.0.0 \
+    -t fontSize=14 \
+    -t disableReconnect=false \
+    -t 'theme={"background":"#1e1e1e","foreground":"#d4d4d4"}' \
+    /tmp/ttyd_wrapper.sh &
 
-# --- Load Packages ---
-echo "[PKG] Loading extensions..."
-tce-load -wi ca-certificates openssl curl parted gdisk >/dev/null 2>&1
+TTYD_PID=$!
+sleep 3
 
-# --- Disk Wipe ---
-echo "[DISK] Wiping $TARGET_DISK..."
-umount -f "${TARGET_DISK}"* 2>/dev/null
+if kill -0 "$TTYD_PID" 2>/dev/null; then
+    echo "[TTYD] ✓ Web terminal running (PID: $TTYD_PID)"
+    echo "[TTYD] ✓ Access at http://$PUBLIC_IP:$GOTTY_PORT/"
+else
+    echo "[TTYD] ✗ Failed to start!"
+fi
+
+# === MINIMAL PACKAGES (CHỈ CẦN THIẾT) ===============================
+echo ""
+echo "[PKG] Loading essential packages..."
+# util-linux chứa lsblk, parted cho partition management
+for pkg in ca-certificates openssl curl util-linux parted; do
+    su tc -c "tce-load -wi $pkg" >/dev/null 2>&1 || echo "[PKG] Warning: $pkg failed"
+done
+
+# Try to load ntfs-3g if available (optional, we have injected binary as backup)
+echo "[PKG] Attempting to load ntfs-3g (optional)..."
+su tc -c "tce-load -wi ntfs-3g" >/dev/null 2>&1 && echo "[PKG] ✓ ntfs-3g loaded from repository" || echo "[PKG] ℹ️  ntfs-3g not available, using injected binary"
+
+# === DISK PREPARATION ===============================================
+echo ""
+echo "[DISK] Preparing $TARGET_DISK..."
+
+# Unmount all partitions (dùng mount thay vì lsblk)
+mount | grep "^$TARGET_DISK" | awk '{print $1}' | while read part; do
+    umount -f "$part" 2>/dev/null || true
+done
+
+# Quick wipe MBR/GPT (không cần wipe toàn bộ)
 dd if=/dev/zero of="$TARGET_DISK" bs=1M count=10 conv=fsync 2>/dev/null
 sync
 
-# --- Download & Flash ---
-echo "[IMG] Streaming image from $IMAGE_URL..."
+echo "[DISK] ✓ Ready"
+
+# === DOWNLOAD & DEPLOY IMAGE (STREAM) ===============================
+echo ""
+echo "[IMG] Streaming image to $TARGET_DISK..."
+echo "[IMG] Source: $IMAGE_URL"
+echo "[IMG] Started: $(date)"
+
 START_TIME=$(date +%s)
+
+# Simple stream: wget -S -O- | gunzip | dd (tested and reliable)
+echo "[IMG] PIPE: wget -S -O- | gunzip -c | dd of=$TARGET_DISK bs=4M"
 
 wget --no-check-certificate -S -O- "$IMAGE_URL" 2>>/tmp/deploy.log \
   | gunzip -c \
-  | dd of="$TARGET_DISK" bs=64M conv=fsync 2>>/tmp/deploy.log
+  | dd of="$TARGET_DISK" bs=64M conv=fsync 2>>/tmp/deploy.log &
 
-RC=$?
-END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
+PIPE_PID=$!
+echo "[IMG] Pipeline started (PID: $PIPE_PID)"
 
-if [ "$RC" -ne 0 ]; then
-    echo "[ERR] Image write failed!"
-    sleep 60
-    reboot -f
-fi
-
-echo "[IMG] Completed in ${DURATION}s"
-sync
-partprobe "$TARGET_DISK" 2>/dev/null
-
-# --- Post-Install: Delete Recovery & Expand C: ---
-echo "[DISK] Optimizing partitions..."
-
-# 1. Tìm và xóa Recovery Partition
-RECOVERY_PART=""
-for part in ${TARGET_DISK}*[0-9]; do
-    [ -b "$part" ] || continue
-    LABEL=$(/srv/busybox blkid "$part" 2>/dev/null | grep -oP 'LABEL="\K[^"]+' || echo "")
-    if echo "$LABEL" | grep -qi "recovery\|winre"; then
-        RECOVERY_PART="$part"
+# Monitor progress simple way
+COUNTER=0
+while kill -0 "$PIPE_PID" 2>/dev/null; do
+    echo "[IMG] Installing... ${COUNTER}s"
+    sleep 5
+    COUNTER=$((COUNTER + 5))
+    
+    # Safety timeout 60 minutes
+    if [ "$COUNTER" -gt 3600 ]; then
+        echo "[ERR] Timeout after 60 minutes!"
+        kill -9 "$PIPE_PID" 2>/dev/null || true
         break
     fi
 done
 
-if [ -n "$RECOVERY_PART" ]; then
-    echo "[DISK] Deleting Recovery: $RECOVERY_PART"
-    PART_NUM=$(echo "$RECOVERY_PART" | grep -oE '[0-9]+$')
+# Wait for pipeline completion
+wait "$PIPE_PID"
+RC=$?
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+if [ "$RC" -ne 0 ]; then
+    echo "[ERR] Pipeline failed with exit code: $RC"
+    echo "[ERR] Last 50 lines of log:"
+    tail -50 /tmp/deploy.log
+    echo "[ERR] Sleeping 60s for debugging..."
+    sleep 60
+    reboot -f
+fi
+
+sync
+partprobe "$TARGET_DISK" 2>/dev/null || true
+sleep 2
+echo "[IMG] ✓ Completed in ${DURATION}s"
+
+# === PARTITION MANAGEMENT (NEW) =====================================
+echo ""
+echo "=========================================="
+echo "🔧 PARTITION MANAGEMENT"
+echo "=========================================="
+
+# Reload partition table
+partprobe "$TARGET_DISK" 2>/dev/null || true
+sleep 2
+
+echo ""
+echo "[PART] Current partition table:"
+parted -s "$TARGET_DISK" print 2>/dev/null || /srv/busybox fdisk -l "$TARGET_DISK"
+
+# === STEP 1: XÓA PHÂN VÙNG RECOVERY =================================
+echo ""
+echo "[PART] Step 1: Deleting Recovery partition..."
+
+# Tìm partition recovery (thường là partition cuối hoặc có flag hidden/recovery)
+# Method 1: Tìm partition cuối cùng
+LAST_PART_NUM=$(parted -s "$TARGET_DISK" print 2>/dev/null | grep '^ ' | tail -1 | awk '{print $1}')
+
+if [ -n "$LAST_PART_NUM" ]; then
+    # Kiểm tra xem partition cuối có phải recovery không
+    LAST_PART_INFO=$(parted -s "$TARGET_DISK" print 2>/dev/null | grep "^ $LAST_PART_NUM ")
     
-    if command -v gdisk >/dev/null 2>&1; then
-        echo -e "d\n$PART_NUM\nw\ny" | gdisk "$TARGET_DISK" 2>/dev/null
-    else
-        echo -e "d\n$PART_NUM\nw" | fdisk "$TARGET_DISK" 2>/dev/null
-    fi
-    sync
-    partprobe "$TARGET_DISK" 2>/dev/null
-fi
-
-# 2. Mở rộng partition cuối cùng (C:)
-LAST_PART=$(ls ${TARGET_DISK}*[0-9] 2>/dev/null | tail -1)
-if [ -n "$LAST_PART" ]; then
-    PART_NUM=$(echo "$LAST_PART" | grep -oE '[0-9]+$')
-    echo "[DISK] Expanding partition $PART_NUM on $TARGET_DISK"
-    if command -v parted >/dev/null 2>&1; then
-        parted "$TARGET_DISK" resizepart "$PART_NUM" 100% 2>/dev/null
-    fi
-fi
-
-# --- Optional: FINDHD (Format other disks) ---
-if [ "$FINDHD" = "true" ]; then
-    echo "[FINDHD] Formatting additional disks..."
-    ALL_DISKS=$(fdisk -l 2>/dev/null | grep -E "^Disk /dev/" | awk '{print $2}' | tr -d ':')
-    for disk in $ALL_DISKS; do
-        [ "$disk" = "$TARGET_DISK" ] && continue
-        [ -b "$disk" ] || continue
+    # Windows recovery thường nhỏ (450MB-16GB) và là partition cuối
+    PART_SIZE=$(echo "$LAST_PART_INFO" | awk '{print $4}')
+    
+    echo "[PART] Last partition: #$LAST_PART_NUM (Size: $PART_SIZE)"
+    
+    # Giả định partition cuối là recovery nếu:
+    # - Là partition cuối cùng
+    # - Không phải boot partition (partition 1 hoặc 2 thường là system/boot)
+    if [ "$LAST_PART_NUM" -gt 2 ]; then
+        echo "[PART] Detected possible recovery partition: #$LAST_PART_NUM"
+        echo "[PART] Deleting partition #$LAST_PART_NUM..."
         
-        echo "[FINDHD] Formatting $disk (NTFS)"
-        dd if=/dev/zero of="$disk" bs=1M count=10 2>/dev/null
-        if command -v parted >/dev/null 2>&1; then
-            parted -s "$disk" mklabel gpt
-            parted -s "$disk" mkpart primary ntfs 0% 100%
+        parted -s "$TARGET_DISK" rm "$LAST_PART_NUM" 2>/dev/null || {
+            echo "[PART] ✗ Failed to delete with parted, trying fdisk..."
+            echo -e "d\n${LAST_PART_NUM}\nw" | /srv/busybox fdisk "$TARGET_DISK" 2>/dev/null
+        }
+        
+        sync
+        partprobe "$TARGET_DISK" 2>/dev/null || true
+        sleep 2
+        
+        echo "[PART] ✓ Recovery partition deleted"
+    else
+        echo "[PART] ℹ️  No recovery partition detected (only ${LAST_PART_NUM} partitions)"
+    fi
+else
+    echo "[PART] ⚠️  Could not detect partitions, skipping recovery deletion"
+fi
+
+# === STEP 2: MỞ RỘNG PHÂN VÙNG BOOT LÊN 100% ========================
+echo ""
+echo "[PART] Step 2: Expanding boot partition to 100%..."
+
+# Tìm Windows boot partition (thường là partition lớn nhất, hoặc partition cuối sau khi xóa recovery)
+BOOT_PART_NUM=$(parted -s "$TARGET_DISK" print 2>/dev/null | grep '^ ' | tail -1 | awk '{print $1}')
+
+if [ -n "$BOOT_PART_NUM" ]; then
+    BOOT_PARTITION="${TARGET_DISK}${BOOT_PART_NUM}"
+    
+    # Nếu disk là nvme/mmcblk thì thêm 'p'
+    case "$TARGET_DISK" in
+        *nvme*|*mmcblk*) BOOT_PARTITION="${TARGET_DISK}p${BOOT_PART_NUM}" ;;
+    esac
+    
+    echo "[PART] Boot partition detected: $BOOT_PARTITION (#$BOOT_PART_NUM)"
+    
+    # Resize partition lên 100% disk
+    echo "[PART] Resizing partition #$BOOT_PART_NUM to 100%..."
+    
+    parted -s "$TARGET_DISK" resizepart "$BOOT_PART_NUM" 100% 2>/dev/null || {
+        echo "[PART] ✗ Failed with parted, trying fdisk method..."
+        
+        # Fdisk method: delete and recreate with max size
+        PART_START=$(parted -s "$TARGET_DISK" unit s print 2>/dev/null | grep "^ $BOOT_PART_NUM " | awk '{print $2}' | sed 's/s//')
+        
+        if [ -n "$PART_START" ]; then
+            echo "[PART] Partition starts at sector: $PART_START"
+            # Delete and recreate
+            (
+                echo d
+                echo "$BOOT_PART_NUM"
+                echo n
+                echo p
+                echo "$BOOT_PART_NUM"
+                echo "$PART_START"
+                echo ""
+                echo w
+            ) | /srv/busybox fdisk "$TARGET_DISK" 2>/dev/null
         fi
-    done
+    }
+    
+    sync
+    partprobe "$TARGET_DISK" 2>/dev/null || true
+    sleep 2
+    
+    echo "[PART] ✓ Partition resized"
+    
+    # Setup library paths for ntfsresize
+    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib64:/lib:/usr/lib:$LD_LIBRARY_PATH"
+    
+    # Resize filesystem (NTFS)
+    echo "[PART] Attempting to resize NTFS filesystem..."
+    if [ -f "/usr/local/bin/ntfsresize" ]; then
+        echo "[PART] Using injected ntfsresize..."
+        
+        # Check partition first
+        /usr/local/bin/ntfsresize -f -i "$BOOT_PARTITION" 2>/dev/null || true
+        
+        # Resize to fill partition
+        echo "[PART] Resizing NTFS to fill partition..."
+        /usr/local/bin/ntfsresize -f -f "$BOOT_PARTITION" 2>/dev/null && {
+            echo "[PART] ✓ NTFS filesystem resized successfully"
+        } || {
+            echo "[PART] ⚠️  NTFS resize failed, but Windows will auto-expand on first boot"
+        }
+    elif command -v ntfsresize >/dev/null 2>&1; then
+        echo "[PART] Using system ntfsresize..."
+        ntfsresize -f -f "$BOOT_PARTITION" 2>/dev/null && {
+            echo "[PART] ✓ NTFS resized"
+        } || {
+            echo "[PART] ℹ️  NTFS resize skipped (will auto-expand on first boot)"
+        }
+    else
+        echo "[PART] ℹ️  ntfsresize not available (Windows will auto-expand on first boot)"
+    fi
+else
+    echo "[PART] ⚠️  Could not detect boot partition, skipping resize"
 fi
 
-# --- Bootfix (VPS Special Case) ---
+echo ""
+echo "[PART] Final partition table:"
+parted -s "$TARGET_DISK" print 2>/dev/null || /srv/busybox fdisk -l "$TARGET_DISK"
+
+# === STEP 3: WIPE CÁC Ổ CỨNG KHÁC (NẾU ENABLED) ====================
+if [ "$WIPE_OTHER_DISKS" = "true" ]; then
+    echo ""
+    echo "=========================================="
+    echo "🗑️  WIPING OTHER DISKS"
+    echo "=========================================="
+    
+    # Lấy tên disk base (vd: sda từ /dev/sda)
+    TARGET_DISK_BASE=$(basename "$TARGET_DISK")
+    
+    # Tìm tất cả disks khác
+    OTHER_DISKS=$(ls -1 /sys/block/ | grep -E '^sd|^nvme|^vd|^hd' | grep -v "^${TARGET_DISK_BASE}$" || true)
+    
+    if [ -n "$OTHER_DISKS" ]; then
+        DISK_COUNT=$(echo "$OTHER_DISKS" | wc -l)
+        echo "[WIPE] Found $DISK_COUNT other disk(s) to wipe:"
+        echo "$OTHER_DISKS" | while read disk; do
+            echo "  - /dev/$disk"
+        done
+        echo ""
+        
+        echo "$OTHER_DISKS" | while read disk; do
+            DISK_PATH="/dev/$disk"
+            echo "[WIPE] Processing $DISK_PATH..."
+            
+            # Unmount tất cả partitions
+            mount | grep "^${DISK_PATH}" | awk '{print $1}' | while read part; do
+                umount -f "$part" 2>/dev/null || true
+            done
+            
+            # Wipe MBR/GPT + đầu disk (10MB)
+            echo "[WIPE] Wiping $DISK_PATH (10MB header)..."
+            dd if=/dev/zero of="$DISK_PATH" bs=1M count=10 conv=fsync 2>/dev/null
+            
+            # Tạo GPT mới (empty)
+            echo "[WIPE] Creating clean GPT on $DISK_PATH..."
+            parted -s "$DISK_PATH" mklabel gpt 2>/dev/null || {
+                echo "[WIPE] GPT creation failed, trying msdos..."
+                parted -s "$DISK_PATH" mklabel msdos 2>/dev/null
+            }
+            
+            sync
+            echo "[WIPE] ✓ $DISK_PATH wiped and ready for Windows"
+        done
+        
+        echo ""
+        echo "[WIPE] ✓ All other disks wiped successfully"
+    else
+        echo "[WIPE] ℹ️  No other disks found"
+    fi
+else
+    echo ""
+    echo "[WIPE] ℹ️  WIPE_OTHER_DISKS is disabled, preserving other disks"
+fi
+
+# === BOOTFIX (NẾU CẦN) ==============================================
 if [ "$BOOT_DISK" != "$TARGET_DISK" ] && [ -n "$SWAP_URL" ]; then
-    echo "[BOOT] Writing boot sector to $BOOT_DISK..."
-    wget --no-check-certificate -O- "$SWAP_URL" 2>/dev/null | gunzip -c | dd of="$BOOT_DISK" bs=4M 2>/dev/null
+    echo ""
+    echo "[BOOT] Applying bootfix to $BOOT_DISK..."
+    
+    if wget --no-check-certificate -O /tmp/grub.gz "$SWAP_URL" 2>/dev/null; then
+        gunzip -c /tmp/grub.gz | dd of="$BOOT_DISK" bs=4M conv=fsync 2>/dev/null
+        sync
+        echo "[BOOT] ✓ MBR/bootsector written"
+    else
+        echo "[BOOT] ✗ Bootfix download failed"
+    fi
+else
+    echo "[BOOT] Bootfix skipped (not needed)"
 fi
 
-echo "✅ DEPLOYMENT SUCCESS! Rebooting in 10s..."
-sleep 10
+# === DONE ===========================================================
+echo ""
+echo "=========================================="
+echo "✅ DEPLOYMENT COMPLETE"
+echo "=========================================="
+echo "Duration: ${DURATION}s"
+echo "Target: $TARGET_DISK"
+echo "Recovery partition: DELETED"
+echo "Boot partition: EXPANDED to 100%"
+[ "$WIPE_OTHER_DISKS" = "true" ] && echo "Other disks: WIPED"
+
+# Hiển thị thông tin disk cuối cùng
+echo ""
+echo "Final disk layout:"
+parted -s "$TARGET_DISK" print 2>/dev/null || /srv/busybox fdisk -l "$TARGET_DISK"
+
+echo ""
+echo "🌐 Web terminal will close in 30 seconds"
+echo "   You can still access logs until then"
+echo ""
+
+# Keep ttyd running for 30s để user kịp xem
+for i in 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
+    echo "Rebooting in ${i}s..."
+    sleep 1
+done
+
+echo "Rebooting NOW..."
 reboot -f
 EOFS
 
-# =====================================================================
-# GIAI ĐOẠN 4: INJECT VARIABLES & REPACK
-# =====================================================================
-
-# Inject Host Variables into TinyCore script
+# === INJECT VARIABLES ================================================
 sed -i "s|__TC_GZ_LINK__|$GZ_LINK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_TARGET_DISK__|$TARGET_DISK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_BOOT_DISK__|$BOOT_DISK|g" "$WORKDIR/opt/bootlocal.sh"
@@ -268,13 +633,14 @@ sed -i "s|__TC_HOST_GW__|$HOST_GW|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_NIC__|$HOST_NIC|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_DNS__|$HOST_DNS|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_PUBLIC_IP__|$PUBLIC_IP|g" "$WORKDIR/opt/bootlocal.sh"
-sed -i "s|__TC_FINDHD__|$FINDHD|g" "$WORKDIR/opt/bootlocal.sh"
+sed -i "s|__TC_WIPE_OTHER_DISKS__|$WIPE_OTHER_DISKS|g" "$WORKDIR/opt/bootlocal.sh"
 
 chmod +x "$WORKDIR/opt/bootlocal.sh"
 
-# Ensure startup
+# Ensure autorun (chỉ chạy 1 lần)
 if ! grep -q "bootlocal_executed" "$WORKDIR/etc/init.d/tc-config" 2>/dev/null; then
     cat >> "$WORKDIR/etc/init.d/tc-config" <<'TCCONFIG'
+# Prevent double execution
 if [ ! -f /tmp/bootlocal_executed ]; then
     touch /tmp/bootlocal_executed
     /opt/bootlocal.sh &
@@ -285,10 +651,6 @@ fi
 echo "[5/6] Repacking initrd..."
 find . | cpio -o -H newc 2>/dev/null | gzip -1 > "$INITRD_PATCHED"
 
-# =====================================================================
-# GIAI ĐOẠN 5: EXECUTE KEXEC
-# =====================================================================
-
 echo "[6/6] Booting TinyCore via kexec..."
 CMDLINE="console=tty0 quiet host_ip=$HOST_IP host_gw=$HOST_GW"
 
@@ -298,10 +660,24 @@ kexec -l "$KERNEL_PATH" \
 
 echo ""
 echo "=========================================="
-echo "✅ READY TO BOOT"
+echo "✅ Ready to boot!"
 echo "=========================================="
-echo "🌐 Monitor via: http://$PUBLIC_IP:$GOTTY_PORT/"
-echo "⏱️  Deployment will start automatically after reboot."
+echo "🌐 Web terminal will be available at:"
+echo "   Local:  http://$HOST_IP:$GOTTY_PORT/"
+echo "   Public: http://$PUBLIC_IP:$GOTTY_PORT/"
+echo ""
+echo "📊 Monitor deployment progress in real-time"
+echo "🎯 Target disk: $TARGET_DISK"
+echo "🔧 Post-install tasks:"
+echo "   1. Delete Recovery partition"
+echo "   2. Expand boot partition to 100%"
+if [ "$WIPE_OTHER_DISKS" = "true" ]; then
+    echo "   3. Wipe other disks ($OTHER_DISKS_COUNT found)"
+fi
+echo "⏱️  ETA: ~5-20 minutes depending on image size & tasks"
+echo ""
+echo "⚠️  Make sure port $GOTTY_PORT is open in firewall/security group!"
+echo ""
 echo "Executing kexec in 3 seconds..."
 sleep 3
 
