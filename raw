@@ -10,8 +10,8 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="http://148.100.76.25:3923/WindowsCustom.gz"   # Windows .img.gz URL
-GOTTY_PORT="80"                 # GoTTY web terminal port
+GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Windows .img.gz URL
+GOTTY_PORT="8080"                 # GoTTY web terminal port
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
 # === AUTO-DETECT TARGET DISK (TRƯỚC KHI BOOT TINYCORE) ==============
@@ -172,10 +172,6 @@ chmod +x "$WORKDIR/srv/ttyd"
 # === BOOTLOCAL.SH (OPTIMIZED) ========================================
 cat > "$WORKDIR/opt/bootlocal.sh" <<'EOFS'
 #!/bin/sh
-
-if [ -f /tmp/deploy_running ]; then exit 0; fi
-touch /tmp/deploy_running
-
 IMAGE_URL="__TC_GZ_LINK__"
 TARGET_DISK="__TC_TARGET_DISK__"
 BOOT_DISK="__TC_BOOT_DISK__"
@@ -280,7 +276,7 @@ sync
 
 echo "[DISK] ✓ Ready"
 
-# === DOWNLOAD & DEPLOY IMAGE (OPTIMIZED) ============================
+# === DOWNLOAD & DEPLOY IMAGE (STREAM) ===============================
 echo ""
 echo "[IMG] Streaming image to $TARGET_DISK..."
 echo "[IMG] Source: $IMAGE_URL"
@@ -288,68 +284,50 @@ echo "[IMG] Started: $(date)"
 
 START_TIME=$(date +%s)
 
-# Debug: check wget capability
-echo "[IMG] Testing connection..."
-if ! wget --spider --no-check-certificate "$IMAGE_URL" 2>&1 | grep -q "200 OK\|302 Found\|301 Moved"; then
-    echo "[WARN] wget spider test failed, proceeding anyway..."
-fi
+# Simple stream: wget -S -O- | gunzip | dd (tested and reliable)
+echo "[IMG] PIPE: wget -S -O- | gunzip -c | dd of=$TARGET_DISK bs=4M"
 
-# Stream: wget -> gunzip -> dd (bs=8M cho tốc độ tốt hơn)
-echo "[IMG] Starting stream: wget | gunzip | dd"
-(
-    wget --no-check-certificate --timeout=30 --tries=3 -S -O- "$IMAGE_URL" 2>&1 | \
-        tee /tmp/wget.log | \
-        gunzip -c 2>&1 | \
-        tee /tmp/gunzip.log | \
-        dd of="$TARGET_DISK" bs=64M conv=fsync oflag=direct 2>&1
-) &
+wget --no-check-certificate -S -O- "$IMAGE_URL" 2>>/tmp/deploy.log \
+  | gunzip -c \
+  | dd of="$TARGET_DISK" bs=4M conv=fsync 2>>/tmp/deploy.log &
 
 PIPE_PID=$!
-echo "[IMG] Pipeline PID: $PIPE_PID"
+echo "[IMG] Pipeline started (PID: $PIPE_PID)"
 
-# Monitor progress
+# Monitor progress simple way
 COUNTER=0
 while kill -0 "$PIPE_PID" 2>/dev/null; do
-    # Check dd progress
-    if [ -e "/proc/$PIPE_PID" ]; then
-        WRITTEN=$(cat "/sys/block/$(basename $TARGET_DISK)/stat" 2>/dev/null | awk '{print $7*512/1024/1024}' || echo "?")
-        echo "[IMG] Running... ${COUNTER}s (Written: ${WRITTEN}MB)"
-    fi
+    echo "[IMG] Installing... ${COUNTER}s"
     sleep 5
     COUNTER=$((COUNTER + 5))
     
-    # Timeout after 30 minutes
-    if [ "$COUNTER" -gt 1800 ]; then
-        echo "[ERR] Timeout after 30 minutes!"
+    # Safety timeout 60 minutes
+    if [ "$COUNTER" -gt 3600 ]; then
+        echo "[ERR] Timeout after 60 minutes!"
         kill -9 "$PIPE_PID" 2>/dev/null || true
         break
     fi
 done
 
-# Wait for completion
+# Wait for pipeline completion
 wait "$PIPE_PID"
 RC=$?
+
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
-echo "[IMG] Pipeline exited with code: $RC"
-echo "[IMG] Duration: ${DURATION}s"
-
-# Check logs for errors
 if [ "$RC" -ne 0 ]; then
-    echo "[ERR] Deployment failed! Exit code: $RC"
-    echo "[ERR] === WGET LOG ==="
-    tail -50 /tmp/wget.log 2>/dev/null || echo "No wget log"
-    echo "[ERR] === GUNZIP LOG ==="
-    tail -50 /tmp/gunzip.log 2>/dev/null || echo "No gunzip log"
+    echo "[ERR] Pipeline failed with exit code: $RC"
+    echo "[ERR] Last 50 lines of log:"
+    tail -50 /tmp/deploy.log
     echo "[ERR] Sleeping 60s for debugging..."
     sleep 60
     reboot -f
 fi
 
-echo "[IMG] ✓ Stream completed"
 sync
 partprobe "$TARGET_DISK" 2>/dev/null || true
+echo "[IMG] ✓ Completed in ${DURATION}s"
 
 # === BOOTFIX (NẾU CẦN) ==============================================
 if [ "$BOOT_DISK" != "$TARGET_DISK" ] && [ -n "$SWAP_URL" ]; then
@@ -409,9 +387,16 @@ sed -i "s|__TC_PUBLIC_IP__|$PUBLIC_IP|g" "$WORKDIR/opt/bootlocal.sh"
 
 chmod +x "$WORKDIR/opt/bootlocal.sh"
 
-# Autorun bootlocal.sh
-grep -q "/opt/bootlocal.sh" "$WORKDIR/etc/init.d/tc-config" 2>/dev/null || \
-    echo "/opt/bootlocal.sh &" >> "$WORKDIR/etc/init.d/tc-config"
+# Ensure autorun (chỉ chạy 1 lần)
+if ! grep -q "bootlocal_executed" "$WORKDIR/etc/init.d/tc-config" 2>/dev/null; then
+    cat >> "$WORKDIR/etc/init.d/tc-config" <<'TCCONFIG'
+# Prevent double execution
+if [ ! -f /tmp/bootlocal_executed ]; then
+    touch /tmp/bootlocal_executed
+    /opt/bootlocal.sh &
+fi
+TCCONFIG
+fi
 
 echo "[5/6] Repacking initrd..."
 find . | cpio -o -H newc 2>/dev/null | gzip -1 > "$INITRD_PATCHED"
