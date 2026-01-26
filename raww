@@ -7,9 +7,9 @@ set -euo pipefail
 
 # === USER CONFIG =====================================================
 GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Link file .gz
-GOTTY_PORT="8080"                                       # Port web terminal
+GOTTY_PORT="80"                                       # Port web terminal
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz" # Grub fix (nếu cần)
-FINDHD="false"                                          # Format ổ đĩa phụ (true/false)
+FINDHD="true"                                          # Format ổ đĩa phụ (true/false)
 
 # =====================================================================
 # GIAI ĐOẠN 1: HOST DETECTION (CHẠY TRÊN OS HIỆN TẠI)
@@ -172,7 +172,7 @@ START_TIME=$(date +%s)
 
 wget --no-check-certificate -S -O- "$IMAGE_URL" 2>>/tmp/deploy.log \
   | gunzip -c \
-  | dd of="$TARGET_DISK" bs=4M conv=fsync 2>>/tmp/deploy.log
+  | dd of="$TARGET_DISK" bs=64M conv=fsync 2>>/tmp/deploy.log
 
 RC=$?
 END_TIME=$(date +%s)
