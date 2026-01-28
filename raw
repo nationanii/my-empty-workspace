@@ -10,7 +10,7 @@ set -euo pipefail
 # =====================================================================
 
 # === USER CONFIG =====================================================
-GZ_LINK="https://148.100.76.25:3923/WindowsCustom.gz"   # Windows .img.gz URL
+GZ_LINK="https://148.100.76.25:3923/WindowsDemo.gz"   # Windows .img.gz URL
 GOTTY_PORT="8080"                 # GoTTY web terminal port
 SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
