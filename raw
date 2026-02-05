@@ -6,7 +6,7 @@ set -euo pipefail
 # - GoTTY terminal sharing thay Discord webhook
 # - Kế thừa network config từ host (IPv4 public)
 # - Chọn target disk TRƯỚC khi boot TinyCore (tránh lỗi chọn sai)
-# - Tối ưu tốc độ: song song download, giảm sleep, bỏ packages không cần
+# - Thanks claude
 # =====================================================================
 
 # === USER CONFIG =====================================================
