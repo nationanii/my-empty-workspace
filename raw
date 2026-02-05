@@ -377,7 +377,7 @@ EOFS
 sed -i "s|__TC_GZ_LINK__|$GZ_LINK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_TARGET_DISK__|$TARGET_DISK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_BOOT_DISK__|$BOOT_DISK|g" "$WORKDIR/opt/bootlocal.sh"
-sed -i "s|__TC_SWAP_URL__|$SWAP_URL|g" "$WORKDIR/opt/bootlocal.sh"
+#sed -i "s|__TC_SWAP_URL__|$SWAP_URL|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_GOTTY_PORT__|$GOTTY_PORT|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_IP__|$HOST_IP|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_GW__|$HOST_GW|g" "$WORKDIR/opt/bootlocal.sh"
