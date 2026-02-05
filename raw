@@ -12,7 +12,7 @@ set -euo pipefail
 # === USER CONFIG =====================================================
 GZ_LINK="https://148.100.76.25:3923/WindowsDemo2.gz"   # Windows .img.gz URL
 GOTTY_PORT="80"                 # GoTTY web terminal port
-SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
+#SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
 # === AUTO-DETECT TARGET DISK (TRƯỚC KHI BOOT TINYCORE) ==============
 echo "=========================================="
@@ -330,20 +330,20 @@ partprobe "$TARGET_DISK" 2>/dev/null || true
 echo "[IMG] ✓ Completed in ${DURATION}s"
 
 # === BOOTFIX (NẾU CẦN) ==============================================
-if [ "$BOOT_DISK" != "$TARGET_DISK" ] && [ -n "$SWAP_URL" ]; then
-    echo ""
-    echo "[BOOT] Applying bootfix to $BOOT_DISK..."
-    
-    if wget --no-check-certificate -O /tmp/grub.gz "$SWAP_URL" 2>/dev/null; then
-        gunzip -c /tmp/grub.gz | dd of="$BOOT_DISK" bs=4M conv=fsync 2>/dev/null
-        sync
-        echo "[BOOT] ✓ MBR/bootsector written"
-    else
-        echo "[BOOT] ✗ Bootfix download failed"
-    fi
-else
-    echo "[BOOT] Bootfix skipped (not needed)"
-fi
+# if [ "$BOOT_DISK" != "$TARGET_DISK" ] && [ -n "$SWAP_URL" ]; then
+#    echo ""
+#    echo "[BOOT] Applying bootfix to $BOOT_DISK..."
+#    
+#    if wget --no-check-certificate -O /tmp/grub.gz "$SWAP_URL" 2>/dev/null; then
+#        gunzip -c /tmp/grub.gz | dd of="$BOOT_DISK" bs=4M conv=fsync 2>/dev/null
+#        sync
+#        echo "[BOOT] ✓ MBR/bootsector written"
+#    else
+#        echo "[BOOT] ✗ Bootfix download failed"
+#    fi
+#else
+#    echo "[BOOT] Bootfix skipped (not needed)"
+#fi
 
 # === DONE ===========================================================
 echo ""
@@ -359,15 +359,15 @@ echo "Disk info:"
 /srv/busybox fdisk -l "$TARGET_DISK" 2>/dev/null | grep -E "^Disk |^Device" || echo "Unable to show disk info"
 
 echo ""
-echo "🌐 Web terminal will close in 30 seconds"
+echo "🌐 Web terminal will close in 0 seconds"
 echo "   You can still access logs until then"
 echo ""
 
 # Keep ttyd running for 30s để user kịp xem
-for i in 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
-    echo "Rebooting in ${i}s..."
-    sleep 1
-done
+#for i in 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1; do
+#    echo "Rebooting in ${i}s..."
+#    sleep 1
+#done
 
 echo "Rebooting NOW..."
 reboot -f
