@@ -12,7 +12,7 @@ set -euo pipefail
 # === USER CONFIG =====================================================
 GZ_LINK="https://st7.ranoz.gg/9M98EBYQ-WindowsD2p.gz"   # Windows .img.gz URL
 GOTTY_PORT="80"                 # GoTTY web terminal port
-#SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
+SWAP_URL="https://raw.githubusercontent.com/lt4c/stuff/refs/heads/main/grubsdbuefiwin.gz"
 
 # === AUTO-DETECT TARGET DISK (TRƯỚC KHI BOOT TINYCORE) ==============
 echo "=========================================="
@@ -377,7 +377,7 @@ EOFS
 sed -i "s|__TC_GZ_LINK__|$GZ_LINK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_TARGET_DISK__|$TARGET_DISK|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_BOOT_DISK__|$BOOT_DISK|g" "$WORKDIR/opt/bootlocal.sh"
-#sed -i "s|__TC_SWAP_URL__|$SWAP_URL|g" "$WORKDIR/opt/bootlocal.sh"
+sed -i "s|__TC_SWAP_URL__|$SWAP_URL|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_GOTTY_PORT__|$GOTTY_PORT|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_IP__|$HOST_IP|g" "$WORKDIR/opt/bootlocal.sh"
 sed -i "s|__TC_HOST_GW__|$HOST_GW|g" "$WORKDIR/opt/bootlocal.sh"
