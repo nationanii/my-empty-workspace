@@ -94,7 +94,7 @@ echo "🔍 Detecting public IPv4..."
 PUBLIC_IP=""
 
 # Method 1: AWS EC2 metadata (nhanh nhất cho AWS)
-PUBLIC_IP=$(timeout 2 curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
+PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null)
 
 # Method 2: ifconfig.me
 [ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null)
